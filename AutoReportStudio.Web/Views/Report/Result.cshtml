@@ -1,0 +1,43 @@
+@model ReportResult
+<div class="head"><div><a asp-action="Index">← New report</a><h1>@Model.Title</h1></div><form asp-action="Export" method="post"><button>Export Excel</button></form></div>
+
+<!-- Report Metrics -->
+<div class="card metrics-card">
+    <h3>Report Generation Metrics</h3>
+    <div class="metrics-grid">
+        <div class="metric">
+            <span class="metric-label">Processing Time</span>
+            <span class="metric-value">@((Model.ProcessingTimeMs / 1000.0).ToString("F2"))s</span>
+        </div>
+        <div class="metric">
+            <span class="metric-label">Tokens Generated</span>
+            <span class="metric-value">@Model.TokensGenerated.ToString("N0")</span>
+        </div>
+        <div class="metric">
+            <span class="metric-label">Generated</span>
+            <span class="metric-value">@Model.GeneratedUtc.ToString("g")</span>
+        </div>
+    </div>
+</div>
+
+<div class="card"><h2>Executive Summary</h2><p>@Model.Summary</p></div>
+@foreach (var s in Model.Sections)
+{
+    <div class="card">
+        <h2>@s.Heading</h2><p>@s.Purpose</p>
+        @if (s.Columns.Count > 0)
+        {
+            <div class="scroll"><table><thead><tr>@foreach(var c in s.Columns){
+                <th>@c</th>
+        }
+        </tr></thead><tbody>@foreach(var row in s.Rows){
+        <tr>@foreach(var x in row){
+            <td>@x</td>
+        }
+    </tr>
+}
+</tbody></table></div>
+}
+<details><summary>Generated SQL</summary><pre>@s.Sql</pre></details>
+</div>
+}

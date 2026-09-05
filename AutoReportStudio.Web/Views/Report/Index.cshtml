@@ -32,22 +32,11 @@
 
 @if (Model.Schema != null)
 {
-    <div class="card" id="modelsCard">
-        <h2>2. Select Language Model</h2>
-        <fieldset id="modelsFieldset">
-        <label>Available AI Models</label>
-        <select id="modelSelect">
-            <option value="">Loading models...</option>
-        </select>
-        <p class="hint" id="modelHint">Connecting to Ollama to fetch available models.</p>
-        </fieldset>
-    </div>
-
     <form asp-action="Generate" method="post" id="generateForm">
         @Html.AntiForgeryToken()
         <fieldset id="generateFieldset">
         <div class="card">
-            <h2>3. Select tables — @Model.Schema.DatabaseName</h2>
+            <h2>2. Select tables — @Model.Schema.DatabaseName</h2>
             <div class="grid">
                 @for (int i = 0; i < Model.Schema.Tables.Count; i++)
                 {
@@ -60,6 +49,17 @@
                     </label>
                 }
             </div>
+        </div>
+
+        <div class="card" id="modelsCard">
+            <h2>3. Select Language Model</h2>
+            <fieldset id="modelsFieldset">
+            <label>Available AI Models</label>
+            <select id="modelSelect">
+                <option value="">Loading models...</option>
+            </select>
+            <p class="hint" id="modelHint">Connecting to Ollama to fetch available models.</p>
+            </fieldset>
         </div>
 
         <div class="card">

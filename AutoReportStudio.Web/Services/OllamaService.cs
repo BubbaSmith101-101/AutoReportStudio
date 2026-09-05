@@ -177,6 +177,7 @@ Each section must contain:
 
 For a chart section, also include:
 
+* Charts should always show a key metric or trend that is relevant to the user's request.
 * chartType: One of the supported chart types.
 * xAxis: Exact SQL result column alias used for categories or X-axis values.
 * yAxis: Exact SQL result column alias used for numeric values.

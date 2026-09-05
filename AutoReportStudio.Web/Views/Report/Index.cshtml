@@ -19,11 +19,14 @@
 
 <div class="card">
     <h2>1. Connect</h2>
-    <form asp-action="Discover" method="post">
+    <form asp-action="Discover" method="post" id="discoverForm">
+        @Html.AntiForgeryToken()
+        <fieldset id="discoverFieldset">
         <label>SQL Server connection string</label>
         <textarea asp-for="ConnectionString" rows="3"></textarea>
         <p class="hint">Use a SELECT-only SQL Server account.</p>
-        <button>Discover Tables</button>
+        <button class="btn btn-secondary" type="submit">Discover Tables</button>
+        </fieldset>
     </form>
 </div>
 
@@ -31,19 +34,24 @@
 {
     <div class="card" id="modelsCard">
         <h2>2. Select Language Model</h2>
+        <fieldset id="modelsFieldset">
         <label>Available AI Models</label>
         <select id="modelSelect">
             <option value="">Loading models...</option>
         </select>
         <p class="hint" id="modelHint">Connecting to Ollama to fetch available models.</p>
+        </fieldset>
     </div>
 
     <form asp-action="Generate" method="post" id="generateForm">
+        @Html.AntiForgeryToken()
+        <fieldset id="generateFieldset">
         <div class="card">
             <h2>3. Select tables — @Model.Schema.DatabaseName</h2>
             <div class="grid">
-                @foreach (var t in Model.Schema.Tables)
+                @for (int i = 0; i < Model.Schema.Tables.Count; i++)
                 {
+                    var t = Model.Schema.Tables[i];
                     var v = $"{t.Schema}.{t.Name}";
                     <label class="choice">
                         <input type="checkbox" name="SelectedTables" value="@v" />
@@ -57,21 +65,46 @@
         <div class="card">
             <h2>4. Describe the report</h2>
             <textarea asp-for="Request" rows="5"></textarea>
-            <button type="button" id="generateButton" disabled onclick="submitGenerateForm()">Generate Report</button>
+            <button id="generateButton" type="submit" class="btn btn-primary" disabled>
+                <span id="generateSpinner" class="spinner-border spinner-border-sm d-none" role="status" aria-hidden="true"></span>
+                <span id="generateButtonText">Generate Report</span>
+            </button>
             <p class="hint" id="validationMessage" style="display:none; color: #d32f2f; margin-top: 10px;"></p>
         </div>
+        </fieldset>
     </form>
 }
 
 <script>
     async function loadModels() {
+        console.log('Attempting to load models from /Report/GetModels');
         try {
-            const response = await fetch('/Report/GetModels', { method: 'GET' });
+            const response = await fetch('/Report/GetModels', { 
+                method: 'GET',
+                headers: {
+                    'Accept': 'application/json'
+                }
+            });
+
+            console.log('GetModels response status:', response.status);
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
             const models = await response.json();
+            console.log('Received models:', models);
+
             const select = document.getElementById('modelSelect');
             const hint = document.getElementById('modelHint');
 
-            if (models && models.length > 0) {
+            // Add null checks to prevent error when elements don't exist
+            if (!select) {
+                console.error('modelSelect element not found');
+                return;
+            }
+
+            if (models && Array.isArray(models) && models.length > 0) {
                 select.innerHTML = '<option value="">-- Select a model --</option>';
                 models.forEach(model => {
                     const option = document.createElement('option');
@@ -79,20 +112,53 @@
                     option.textContent = model;
                     select.appendChild(option);
                 });
-                hint.textContent = 'Select an AI model to use for report generation.';
+                if (hint) hint.textContent = 'Select an AI model to use for report generation.';
             } else {
                 select.innerHTML = '<option value="">No models available</option>';
-                hint.textContent = 'No AI models found. Please ensure Ollama is running and models are installed.';
+                if (hint) hint.textContent = 'No AI models found. Please ensure Ollama is running and models are installed.';
             }
             validateForm();
         } catch (error) {
             console.error('Error loading models:', error);
             const hint = document.getElementById('modelHint');
-            hint.textContent = 'Failed to load models. Please check that Ollama is running.';
+            if (hint) hint.textContent = `Failed to load models: ${error.message}`;
             const select = document.getElementById('modelSelect');
-            select.innerHTML = '<option value="">Failed to load models</option>';
+            if (select) select.innerHTML = '<option value="">Failed to load models</option>';
         }
     }
+
+    // Call loadModels after DOM is fully loaded
+    document.addEventListener('DOMContentLoaded', loadModels);
+
+    // Disable Discover form's fieldset while it submits
+    const discoverForm = document.getElementById('discoverForm');
+    if (discoverForm) {
+        discoverForm.addEventListener('submit', function() {
+            // Defer disabling until after the browser has captured form data,
+            // otherwise disabled fields are excluded from the submission.
+            setTimeout(() => {
+                const discoverFieldset = document.getElementById('discoverFieldset');
+                if (discoverFieldset) discoverFieldset.disabled = true;
+            }, 0);
+        });
+    }
+
+    // Add event listeners for form validation triggers
+    const modelSelect = document.getElementById('modelSelect');
+    const requestTextarea = document.querySelector('[name="Request"]');
+    const checkboxes = document.querySelectorAll('[name="SelectedTables"]');
+
+    if (modelSelect) {
+        modelSelect.addEventListener('change', validateForm);
+    }
+
+    if (requestTextarea) {
+        requestTextarea.addEventListener('input', validateForm);
+    }
+
+    checkboxes.forEach(checkbox => {
+        checkbox.addEventListener('change', validateForm);
+    });
 
     function validateForm() {
         const modelSelect = document.getElementById('modelSelect');
@@ -101,7 +167,14 @@
         const generateButton = document.getElementById('generateButton');
         const validationMessage = document.getElementById('validationMessage');
 
+        console.log('validateForm called:', {
+            modelSelect: modelSelect ? modelSelect.value : 'not found',
+            requestValue: requestTextarea ? requestTextarea.value : 'not found',
+            checkboxesChecked: tableCheckboxes.length
+        });
+
         if (!modelSelect || !requestTextarea || !generateButton) {
+            console.log('validateForm: missing required elements');
             return;
         }
 
@@ -109,6 +182,8 @@
         const requestFilled = requestTextarea.value.trim() !== '';
         const tablesSelected = tableCheckboxes && tableCheckboxes.length > 0;
         const isFormValid = modelSelected && requestFilled && tablesSelected;
+
+        console.log('Validation results:', { modelSelected, requestFilled, tablesSelected, isFormValid });
 
         generateButton.disabled = !isFormValid;
 
@@ -131,72 +206,63 @@
         }
     }
 
-    function submitGenerateForm() {
-        const modelSelect = document.getElementById('modelSelect');
-        const generateForm = document.getElementById('generateForm');
+    // Add submit handler to show loading overlay
+    const generateForm = document.getElementById('generateForm');
+    if (generateForm) {
+        generateForm.addEventListener('submit', function(e) {
+            const modelSelect = document.getElementById('modelSelect');
+            if (modelSelect && modelSelect.value) {
+                // Add model and connection string as hidden inputs before submit
+                const modelInput = document.createElement('input');
+                modelInput.type = 'hidden';
+                modelInput.name = 'SelectedModel';
+                modelInput.value = modelSelect.value;
+                generateForm.appendChild(modelInput);
 
-        if (!modelSelect || !modelSelect.value) {
-            alert('Please select a language model before generating the report.');
-            return;
+                const connInput = document.createElement('input');
+                connInput.type = 'hidden';
+                connInput.name = 'ConnectionString';
+                connInput.value = document.querySelector('[name="ConnectionString"]').value;
+                generateForm.appendChild(connInput);
+
+                showLoadingSpinner();
+
+                // Defer disabling inputs until after the browser has captured
+                // the form data, otherwise disabled fields (checkboxes, select,
+                // textarea) are excluded from the submission.
+                setTimeout(disableFormInputs, 0);
+            }
+        });
+    }
+
+    function disableFormInputs() {
+        // Disable all fieldsets across the page so nothing can be changed while processing
+        const fieldsets = document.querySelectorAll('fieldset');
+        fieldsets.forEach(fs => fs.disabled = true);
+
+        // Update the Generate button to show a spinner and disable it explicitly
+        const generateButton = document.getElementById('generateButton');
+        const generateSpinner = document.getElementById('generateSpinner');
+        const generateButtonText = document.getElementById('generateButtonText');
+        if (generateButton) {
+            generateButton.disabled = true;
         }
-
-        // Show loading overlay first
-        showLoadingSpinner();
-
-        // Create a hidden input for the selected model just before submitting
-        const modelInput = document.createElement('input');
-        modelInput.type = 'hidden';
-        modelInput.name = 'SelectedModel';
-        modelInput.value = modelSelect.value;
-        generateForm.appendChild(modelInput);
-
-        // Also need to add the connection string
-        const connInput = document.createElement('input');
-        connInput.type = 'hidden';
-        connInput.name = 'ConnectionString';
-        connInput.value = document.querySelector('[name="ConnectionString"]').value;
-        generateForm.appendChild(connInput);
-
-        console.log('Submitting form with model:', modelSelect.value);
-
-        // Small delay to ensure spinner renders before form submission
-        setTimeout(() => {
-            generateForm.submit();
-        }, 100);
+        if (generateSpinner) {
+            generateSpinner.classList.remove('d-none');
+        }
+        if (generateButtonText) {
+            generateButtonText.textContent = 'Generating...';
+        }
     }
 
     function showLoadingSpinner() {
         const overlay = document.getElementById('loadingOverlay');
+        const processingStatus = document.getElementById('processingStatus');
         if (overlay) {
-            overlay.style.display = 'flex !important';
-            overlay.style.visibility = 'visible';
-            const processingStatus = document.getElementById('processingStatus');
-            if (processingStatus) {
-                processingStatus.textContent = 'This may take a minute or two...';
-            }
-            console.log('Loading overlay displayed');
+            overlay.style.display = 'block';
+        }
+        if (processingStatus) {
+            processingStatus.textContent = 'Connecting...';
         }
     }
-
-    document.addEventListener('DOMContentLoaded', () => {
-        loadModels();
-
-        const modelSelect = document.getElementById('modelSelect');
-        if (modelSelect) {
-            modelSelect.addEventListener('change', validateForm);
-        }
-
-        const requestTextarea = document.querySelector('[name="Request"]');
-        if (requestTextarea) {
-            requestTextarea.addEventListener('input', validateForm);
-            requestTextarea.addEventListener('change', validateForm);
-        }
-
-        const tableCheckboxes = document.querySelectorAll('[name="SelectedTables"]');
-        tableCheckboxes.forEach(checkbox => {
-            checkbox.addEventListener('change', validateForm);
-        });
-
-        validateForm();
-    });
 </script>

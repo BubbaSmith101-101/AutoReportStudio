@@ -1,4 +1,16 @@
 @model ReportResult
+@using System.Text.Json
+@functions {
+    static string FormatCell(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return value ?? "";
+        if (DateTime.TryParse(value, out var dt) && value.Contains(':'))
+        {
+            return dt.TimeOfDay == TimeSpan.Zero ? dt.ToString("d") : dt.ToString("g");
+        }
+        return value;
+    }
+}
 <div class="head"><div><a asp-action="Index">← New report</a><h1>@Model.Title</h1></div><form asp-action="Export" method="post"><button>Export Excel</button></form></div>
 
 <!-- Report Metrics -->
@@ -14,30 +26,100 @@
             <span class="metric-value">@Model.TokensGenerated.ToString("N0")</span>
         </div>
         <div class="metric">
+            <span class="metric-label">Tokens / Second</span>
+            <span class="metric-value">@((Model.ProcessingTimeMs > 0 ? Model.TokensGenerated / (Model.ProcessingTimeMs / 1000.0) : 0).ToString("F2"))</span>
+        </div>
+        <div class="metric">
+            <span class="metric-label">Time to First Token</span>
+            <span class="metric-value">@((Model.TimeToFirstTokenMs / 1000.0).ToString("F2"))s</span>
+        </div>
+        <div class="metric">
             <span class="metric-label">Generated</span>
-            <span class="metric-value">@Model.GeneratedUtc.ToString("g")</span>
+            <span class="metric-value">@Model.GeneratedUtc.ToLocalTime().ToString("g")</span>
+        </div>
+        <div class="metric">
+            <span class="metric-label">Model Used</span>
+            <span class="metric-value">@(string.IsNullOrEmpty(Model.ModelUsed) ? "Default" : Model.ModelUsed)</span>
         </div>
     </div>
 </div>
 
 <div class="card"><h2>Executive Summary</h2><p>@Model.Summary</p></div>
+@{ int chartIndex = 0; }
 @foreach (var s in Model.Sections)
 {
     <div class="card">
         <h2>@s.Heading</h2><p>@s.Purpose</p>
-        @if (s.Columns.Count > 0)
+        @if (string.Equals(s.Type, "chart", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(s.XAxis) && !string.IsNullOrEmpty(s.YAxis) && s.Columns.Count > 0)
+        {
+            var canvasId = $"chart_{chartIndex}";
+            var xIdx = s.Columns.FindIndex(c => string.Equals(c, s.XAxis, StringComparison.OrdinalIgnoreCase));
+            var yIdx = s.Columns.FindIndex(c => string.Equals(c, s.YAxis, StringComparison.OrdinalIgnoreCase));
+            if (xIdx >= 0 && yIdx >= 0)
+            {
+                var labels = s.Rows.Select(r => r.Count > xIdx ? FormatCell(r[xIdx]) : "").ToList();
+                var values = s.Rows.Select(r => r.Count > yIdx ? (double.TryParse(r[yIdx], out var d) ? d : 0) : 0).ToList();
+                var chartType = (s.ChartType ?? "bar").ToLowerInvariant();
+                var jsChartType = chartType switch
+                {
+                    "column" => "bar",
+                    "area" => "line",
+                    "doughnut" => "doughnut",
+                    "pie" => "pie",
+                    "scatter" => "scatter",
+                    "line" => "line",
+                    _ => "bar"
+                };
+                var fill = chartType == "area";
+                <div class="chart-container" style="position:relative; max-width:800px; margin-bottom:1rem;">
+                    <canvas id="@canvasId"></canvas>
+                </div>
+                <script>
+                    (function () {
+                        var ctx = document.getElementById('@canvasId').getContext('2d');
+                        new Chart(ctx, {
+                            type: '@jsChartType',
+                            data: {
+                                labels: @Html.Raw(JsonSerializer.Serialize(labels)),
+                                datasets: [{
+                                    label: '@Html.Raw(s.YAxisTitle ?? s.YAxis)',
+                                    data: @Html.Raw(JsonSerializer.Serialize(values)),
+                                    fill: @fill.ToString().ToLowerInvariant(),
+                                    backgroundColor: ['#4e79a7','#f28e2b','#e15759','#76b7b2','#59a14f','#edc948','#b07aa1','#ff9da7','#9c755f','#bab0ac'],
+                                    borderColor: '#4e79a7',
+                                    tension: 0.3
+                                }]
+                            },
+                            options: {
+                                responsive: true,
+                                plugins: {
+                                    legend: { display: '@jsChartType' === 'pie' || '@jsChartType' === 'doughnut' }
+                                },
+                                scales: ('@jsChartType' === 'pie' || '@jsChartType' === 'doughnut') ? {} : {
+                                    x: { title: { display: true, text: '@Html.Raw(s.XAxisTitle ?? s.XAxis)' } },
+                                    y: { title: { display: true, text: '@Html.Raw(s.YAxisTitle ?? s.YAxis)' } }
+                                }
+                            }
+                        });
+                    })();
+                </script>
+                chartIndex++;
+            }
+        }
+        else if (s.Columns.Count > 0)
         {
             <div class="scroll"><table><thead><tr>@foreach(var c in s.Columns){
                 <th>@c</th>
         }
         </tr></thead><tbody>@foreach(var row in s.Rows){
         <tr>@foreach(var x in row){
-            <td>@x</td>
+            <td>@FormatCell(x)</td>
         }
     </tr>
 }
 </tbody></table></div>
-}
+        }
 <details><summary>Generated SQL</summary><pre>@s.Sql</pre></details>
 </div>
+}
 }

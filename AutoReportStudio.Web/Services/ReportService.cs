@@ -26,6 +26,24 @@ public class ReportService : IReportService
     {
         logger.LogDebug("Entering Generate method with {TableCount} selected tables", selected.Count);
         var startTime = DateTime.UtcNow;
+        long timeToFirstTokenMs = 0;
+        using var firstTokenCts = new CancellationTokenSource();
+        var firstTokenWatch = Task.Run(async () =>
+        {
+            try
+            {
+                while (!firstTokenCts.IsCancellationRequested)
+                {
+                    if (ollama.GetTotalTokensGenerated() > 0)
+                    {
+                        timeToFirstTokenMs = (long)(DateTime.UtcNow - startTime).TotalMilliseconds;
+                        return;
+                    }
+                    await Task.Delay(15, firstTokenCts.Token);
+                }
+            }
+            catch (OperationCanceledException) { }
+        });
         try
         {
             logger.LogInformation("Starting report generation for {SelectedTableCount} tables with model {SelectedModel}", selected.Count, selectedModel ?? "default");
@@ -44,7 +62,7 @@ public class ReportService : IReportService
             var plan = await ollama.Plan(db, request, selectedModel, ct); 
             logger.LogInformation("AI plan generated with {SectionCount} sections", plan.Sections.Count);
 
-            var result = new ReportResult { Title = plan.Title };
+            var result = new ReportResult { Title = plan.Title, ModelUsed = selectedModel ?? "" };
             await using var cn = new SqlConnection(cs); 
             await cn.OpenAsync(ct);
             logger.LogDebug("Database connection opened");
@@ -53,7 +71,18 @@ public class ReportService : IReportService
             foreach (var p in plan.Sections.Take(6))
             {
                 logger.LogDebug("Processing section: {SectionHeading}", p.Heading);
-                var sec = new ReportSection { Heading = p.Heading, Purpose = p.Purpose, Sql = p.Sql }; 
+                var sec = new ReportSection
+                {
+                    Heading = p.Heading,
+                    Purpose = p.Purpose,
+                    Sql = p.Sql,
+                    Type = string.IsNullOrWhiteSpace(p.Type) ? "table" : p.Type.ToLowerInvariant(),
+                    ChartType = p.ChartType,
+                    XAxis = p.XAxis,
+                    YAxis = p.YAxis,
+                    XAxisTitle = p.XAxisTitle,
+                    YAxisTitle = p.YAxisTitle
+                };
                 result.Sections.Add(sec);
 
                 var q = Regex.Replace(p.Sql, @"(--.*?$)|(/\*.*?\*/)", " ", RegexOptions.Multiline | RegexOptions.Singleline).Trim();
@@ -100,7 +129,11 @@ public class ReportService : IReportService
             result.ProcessingTimeMs = (long)elapsed.TotalMilliseconds;
             result.TokensGenerated = ollama.GetTotalTokensGenerated();
 
-            logger.LogInformation("Report generation completed successfully in {ProcessingTimeMs}ms with {TokensGenerated} tokens", result.ProcessingTimeMs, result.TokensGenerated);
+            firstTokenCts.Cancel();
+            try { await firstTokenWatch; } catch (OperationCanceledException) { }
+            result.TimeToFirstTokenMs = timeToFirstTokenMs;
+
+            logger.LogInformation("Report generation completed successfully in {ProcessingTimeMs}ms with {TokensGenerated} tokens (first token at {TimeToFirstTokenMs}ms)", result.ProcessingTimeMs, result.TokensGenerated, result.TimeToFirstTokenMs);
             return result;
         }
         catch (Exception ex)
@@ -110,6 +143,7 @@ public class ReportService : IReportService
         }
         finally
         {
+            firstTokenCts.Cancel();
             logger.LogDebug("Exiting Generate method");
         }
     }

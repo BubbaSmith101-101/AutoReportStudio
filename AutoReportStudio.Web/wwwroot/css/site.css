@@ -10,6 +10,40 @@ body {
     margin: auto
 }
 
+.back-to-top {
+    position: fixed;
+    right: 24px;
+    bottom: 24px;
+    width: 46px;
+    height: 46px;
+    border-radius: 50%;
+    background: #2563eb;
+    color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 22px;
+    font-weight: 700;
+    text-decoration: none;
+    box-shadow: 0 4px 14px #0000002e;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(10px);
+    transition: opacity 0.2s ease, transform 0.2s ease, visibility 0.2s;
+    z-index: 1000;
+}
+
+    .back-to-top.visible {
+        opacity: 1;
+        visibility: visible;
+        transform: translateY(0);
+    }
+
+    .back-to-top:hover {
+        background: #1d4ed8;
+    }
+
+
 header {
     background: #111827;
     padding: 18px
@@ -126,6 +160,12 @@ button {
 
 .scroll {
     overflow: auto
+}
+
+.no-data {
+    color: #6b7280;
+    font-style: italic;
+    padding: 12px 0;
 }
 
 table {

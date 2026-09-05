@@ -129,8 +129,8 @@ GENERAL RULES
 * Use ONLY tables and columns that exist in the supplied schema.
 * Never invent tables, columns, relationships, or data.
 * Use fully qualified bracketed SQL Server table names, for example [dbo].[Employees].
-* Every SQL query must be Sunday through Saturday.read-only.
-* The work week runs from 
+* Every SQL query must be read-only.
+* The work week runs from Sunday through Saturday.
 * Every query must be either:
 
   1. A single SELECT statement, or

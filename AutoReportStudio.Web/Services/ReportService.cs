@@ -62,7 +62,7 @@ public class ReportService : IReportService
             var plan = await ollama.Plan(db, request, selectedModel, ct); 
             logger.LogInformation("AI plan generated with {SectionCount} sections", plan.Sections.Count);
 
-            var result = new ReportResult { Title = plan.Title, ModelUsed = selectedModel ?? "" };
+            var result = new ReportResult { Title = plan.Title, ModelUsed = selectedModel ?? "", UserRequest = request };
             await using var cn = new SqlConnection(cs); 
             await cn.OpenAsync(ct);
             logger.LogDebug("Database connection opened");

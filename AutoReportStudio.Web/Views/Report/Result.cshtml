@@ -41,6 +41,10 @@
             <span class="metric-label">Model Used</span>
             <span class="metric-value">@(string.IsNullOrEmpty(Model.ModelUsed) ? "Default" : Model.ModelUsed)</span>
         </div>
+        <div class="metric metric-wide">
+            <span class="metric-label">Instructions</span>
+            <span class="metric-value">@Model.UserRequest</span>
+        </div>
     </div>
 </div>
 
@@ -48,8 +52,9 @@
 @{ int chartIndex = 0; }
 @foreach (var s in Model.Sections)
 {
-    <div class="card">
-        <h2>@s.Heading</h2><p>@s.Purpose</p>
+    <details class="card section-card" open>
+        <summary class="section-summary"><h2>@s.Heading</h2></summary>
+        <p>@s.Purpose</p>
         @if (string.Equals(s.Type, "chart", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(s.XAxis) && !string.IsNullOrEmpty(s.YAxis) && s.Columns.Count > 0)
         {
             var canvasId = $"chart_{chartIndex}";
@@ -120,6 +125,5 @@
 </tbody></table></div>
         }
 <details><summary>Generated SQL</summary><pre>@s.Sql</pre></details>
-</div>
-}
+</details>
 }

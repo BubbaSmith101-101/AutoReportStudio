@@ -34,6 +34,41 @@ main {
     box-shadow: 0 4px 18px #0000000a
 }
 
+.section-card {
+    padding: 0 22px 22px
+}
+
+.section-summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 22px 0;
+    display: block;
+}
+
+    .section-summary::-webkit-details-marker {
+        display: none
+    }
+
+    .section-summary h2 {
+        display: inline-block;
+        margin: 0;
+        position: relative;
+        padding-left: 22px
+    }
+
+        .section-summary h2::before {
+            content: "\25B6";
+            position: absolute;
+            left: 0;
+            font-size: 0.7em;
+            top: 0.35em;
+            transition: transform 0.15s ease
+        }
+
+.section-card[open] > .section-summary h2::before {
+    transform: rotate(90deg)
+}
+
 textarea {
     width: 100%;
     padding: 12px;
@@ -211,3 +246,16 @@ pre {
     font-weight: 700;
     color: #2563eb;
 }
+
+.metric-wide {
+    grid-column: 1 / -1;
+    align-items: flex-start;
+}
+
+    .metric-wide .metric-value {
+        font-size: 15px;
+        font-weight: 500;
+        color: #172033;
+        white-space: pre-wrap;
+        text-align: left;
+    }

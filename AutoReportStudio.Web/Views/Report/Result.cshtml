@@ -108,7 +108,9 @@
                     var values = s.Rows.Select(r => r.Count > yIdx ? (double.TryParse(r[yIdx], out var d) ? d : 0) : 0).ToList();
                     datasets = new List<object> { new { label = s.YAxisTitle ?? s.YAxis, data = values, fill, backgroundColor = palette, borderColor = palette[0], tension = 0.3 } };
                 }
-                <div class="chart-container" style="position:relative; max-width:800px; margin-bottom:1rem;">
+                var isCircular = jsChartType == "pie" || jsChartType == "doughnut";
+                var containerClass = isCircular ? "chart-container chart-container-circular" : "chart-container";
+                <div class="@containerClass" style="position:relative; max-width:800px; margin-bottom:1rem;">
                     <canvas id="@canvasId"></canvas>
                 </div>
                 <script>

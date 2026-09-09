@@ -50,14 +50,14 @@ public class ReportController : Controller
         logger.LogDebug("Entering GetModels action");
         try
         {
-            var models = await ollama.ListModels(ct);
+            var models = await ollama.ListModelsWithDetails(ct);
             logger.LogInformation("Retrieved {ModelCount} available models", models.Count);
             return Json(models);
         }
         catch (Exception ex)
         {
             logger.LogError(ex, "Error retrieving models: {ErrorMessage}", ex.Message);
-            return Json(new List<string>());
+            return Json(new List<OllamaModelInfo>());
         }
         finally
         {

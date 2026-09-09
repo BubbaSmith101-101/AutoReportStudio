@@ -133,6 +133,18 @@ button {
     gap: 10px
 }
 
+.table-select-actions {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.btn-sm {
+    padding: 6px 14px;
+    margin-top: 0;
+    font-size: 13px;
+}
+
 .choice {
     border: 1px solid #dfe5ed;
     padding: 12px;

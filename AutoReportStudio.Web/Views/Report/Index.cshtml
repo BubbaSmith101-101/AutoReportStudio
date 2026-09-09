@@ -37,6 +37,10 @@
         <fieldset id="generateFieldset">
         <div class="card">
             <h2>2. Select tables — @Model.Schema.DatabaseName</h2>
+            <div class="table-select-actions">
+                <button type="button" id="selectAllTablesBtn" class="btn btn-secondary btn-sm">Select All</button>
+                <button type="button" id="clearAllTablesBtn" class="btn btn-secondary btn-sm">Clear All</button>
+            </div>
             <div class="grid">
                 @for (int i = 0; i < Model.Schema.Tables.Count; i++)
                 {
@@ -76,6 +80,39 @@
 }
 
 <script>
+    function formatBytes(bytes) {
+        if (!bytes || bytes <= 0) return null;
+        const gb = bytes / (1024 * 1024 * 1024);
+        if (gb >= 1) return gb.toFixed(1) + ' GB';
+        const mb = bytes / (1024 * 1024);
+        return mb.toFixed(0) + ' MB';
+    }
+
+    function formatModelLabel(model) {
+        const name = model && model.name ? model.name : model;
+        const sizeLabel = (model && model.parameterSize)
+            ? model.parameterSize
+            : formatBytes(model ? model.sizeBytes : 0);
+        return sizeLabel ? `${name} (${sizeLabel})` : name;
+    }
+
+    function parseParameterSize(parameterSize) {
+        if (!parameterSize) return 0;
+        const match = /^([\d.]+)\s*([kmbtKMBT])?/.exec(parameterSize.trim());
+        if (!match) return 0;
+        const value = parseFloat(match[1]);
+        if (isNaN(value)) return 0;
+        const unit = (match[2] || '').toUpperCase();
+        const multipliers = { K: 1e3, M: 1e6, B: 1e9, T: 1e12 };
+        return value * (multipliers[unit] || 1);
+    }
+
+    function getModelSortValue(model) {
+        if (!model) return 0;
+        const paramValue = parseParameterSize(model.parameterSize);
+        return paramValue > 0 ? paramValue : (model.sizeBytes || 0);
+    }
+
     async function loadModels() {
         console.log('Attempting to load models from /Report/GetModels');
         try {
@@ -105,11 +142,12 @@
             }
 
             if (models && Array.isArray(models) && models.length > 0) {
+                models.sort((a, b) => getModelSortValue(b) - getModelSortValue(a));
                 select.innerHTML = '<option value="">-- Select a model --</option>';
                 models.forEach(model => {
                     const option = document.createElement('option');
-                    option.value = model;
-                    option.textContent = model;
+                    option.value = model.name;
+                    option.textContent = formatModelLabel(model);
                     select.appendChild(option);
                 });
                 if (hint) hint.textContent = 'Select an AI model to use for report generation.';
@@ -159,6 +197,23 @@
     checkboxes.forEach(checkbox => {
         checkbox.addEventListener('change', validateForm);
     });
+
+    const selectAllTablesBtn = document.getElementById('selectAllTablesBtn');
+    const clearAllTablesBtn = document.getElementById('clearAllTablesBtn');
+
+    if (selectAllTablesBtn) {
+        selectAllTablesBtn.addEventListener('click', function () {
+            checkboxes.forEach(checkbox => { checkbox.checked = true; });
+            validateForm();
+        });
+    }
+
+    if (clearAllTablesBtn) {
+        clearAllTablesBtn.addEventListener('click', function () {
+            checkboxes.forEach(checkbox => { checkbox.checked = false; });
+            validateForm();
+        });
+    }
 
     function validateForm() {
         const modelSelect = document.getElementById('modelSelect');

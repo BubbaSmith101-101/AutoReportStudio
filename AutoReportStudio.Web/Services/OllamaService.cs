@@ -19,9 +19,18 @@ public class OllamaResponse
     public long prompt_eval_count { get; set; } = 0;
 }
 
+// Model metadata returned by the Ollama /api/tags endpoint
+public class OllamaModelInfo
+{
+    public string Name { get; set; } = "";
+    public string? ParameterSize { get; set; }
+    public long SizeBytes { get; set; } = 0;
+}
+
 public interface IOllamaService 
 { 
     Task<List<string>> ListModels(CancellationToken ct = default);
+    Task<List<OllamaModelInfo>> ListModelsWithDetails(CancellationToken ct = default);
     Task<ReportPlan> Plan(DbSchema schema, string request, string? selectedModel = null, CancellationToken ct = default); 
     Task<string> Summarize(ReportResult report, string? selectedModel = null, CancellationToken ct = default);
     long GetTotalTokensGenerated();
@@ -109,6 +118,79 @@ public class OllamaService : IOllamaService
         }
     }
 
+    public async Task<List<OllamaModelInfo>> ListModelsWithDetails(CancellationToken ct = default)
+    {
+        logger.LogDebug("Entering ListModelsWithDetails method");
+        try
+        {
+            var client = f.CreateClient();
+            var url = (cfg["Ollama:BaseUrl"] ?? "http://localhost:11434").TrimEnd('/');
+            logger.LogInformation("Fetching available models with details from Ollama at {Url}", url);
+
+            var res = await client.GetAsync(url + "/api/tags", ct);
+            logger.LogDebug("Ollama tags API response status: {StatusCode}", res.StatusCode);
+
+            if (!res.IsSuccessStatusCode)
+            {
+                logger.LogWarning("Failed to fetch models from Ollama, status: {StatusCode}", res.StatusCode);
+                return new List<OllamaModelInfo>();
+            }
+
+            var responseBody = await res.Content.ReadAsStringAsync(ct);
+            using var doc = JsonDocument.Parse(responseBody);
+
+            var models = new List<OllamaModelInfo>();
+            if (doc.RootElement.TryGetProperty("models", out var modelsArray))
+            {
+                foreach (var model in modelsArray.EnumerateArray())
+                {
+                    if (!model.TryGetProperty("name", out var nameElement))
+                    {
+                        continue;
+                    }
+
+                    var modelName = nameElement.GetString();
+                    if (string.IsNullOrEmpty(modelName))
+                    {
+                        continue;
+                    }
+
+                    var info = new OllamaModelInfo { Name = modelName };
+
+                    if (model.TryGetProperty("size", out var sizeElement) && sizeElement.TryGetInt64(out var sizeBytes))
+                    {
+                        info.SizeBytes = sizeBytes;
+                    }
+
+                    if (model.TryGetProperty("details", out var detailsElement) &&
+                        detailsElement.TryGetProperty("parameter_size", out var paramSizeElement))
+                    {
+                        info.ParameterSize = paramSizeElement.GetString();
+                    }
+
+                    models.Add(info);
+                }
+            }
+
+            logger.LogInformation("Successfully fetched {ModelCount} models with details from Ollama", models.Count);
+            return models;
+        }
+        catch (HttpRequestException ex)
+        {
+            logger.LogWarning(ex, "Failed to connect to Ollama for listing models with details");
+            return new List<OllamaModelInfo>();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error listing models with details from Ollama: {ErrorMessage}", ex.Message);
+            return new List<OllamaModelInfo>();
+        }
+        finally
+        {
+            logger.LogDebug("Exiting ListModelsWithDetails method");
+        }
+    }
+
     public async Task<ReportPlan> Plan(DbSchema schema, string request, string? selectedModel = null, CancellationToken ct = default)
     {
         logger.LogDebug("Entering Plan method");
@@ -123,6 +205,11 @@ Your job is to analyze the user's reporting request and create a report plan usi
 GENERAL RULES
 
 * Return valid JSON only.
+* When generating SQL, make certain that all fields joined are of the correct data type and that all joins are valid based on the supplied schema.
+  
+  1. Ensure that the following error does not occur: Operand type clash: date is incompatible with int.
+  2. Ensure that you do not use ambiguous column names in your SQL queries, for example 'MonthLabel'.
+
 * Do not include Markdown.
 * Do not include ```json code fences.
 * Do not include explanations before or after the JSON.
@@ -147,6 +234,7 @@ CHART RULES
 * Charts must be based entirely on the SQL query contained in that section.
 * Prefer aggregated SQL suitable for visualization.
 * Choose the chart type that best represents the requested information.
+* Legends used in a chart must use the came color as what was used in the chart.
 * Supported chart types are:
 
   * bar

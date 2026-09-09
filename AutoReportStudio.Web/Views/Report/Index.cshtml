@@ -42,16 +42,23 @@
                 <button type="button" id="clearAllTablesBtn" class="btn btn-secondary btn-sm">Clear All</button>
                 <div class="pagination-controls">
                     <span class="page-info">Page @Model.CurrentPage of @Model.TotalPages (@Model.TotalItems tables)</span>
-                    <button type="button" id="prevPageBtn" class="btn btn-secondary btn-sm" @(Model.CurrentPage <= 1 ? "disabled" : "")>Previous</button>
-                    <button type="button" id="nextPageBtn" class="btn btn-secondary btn-sm" @(Model.CurrentPage >= Model.TotalPages ? "disabled" : "")>Next</button>
+                    <label class="page-size-label">Show
+                        <select id="pageSizeSelect" class="page-size-select">
+                            @foreach (var size in new[] { 10, 20, 50, 100 })
+                            {
+                                <option value="@size" selected="@(Model.PageSize == size ? "selected" : null)">@size</option>
+                            }
+                            <option value="all" selected="@(Model.PageSize >= Model.TotalItems ? "selected" : null)">All</option>
+                        </select>
+                    </label>
+                    <button type="button" id="firstPageBtn" class="btn btn-secondary btn-sm" @(Model.CurrentPage <= 1 ? "disabled" : "")>&laquo;</button>
+                    <button type="button" id="prevPageBtn" class="btn btn-secondary btn-sm" @(Model.CurrentPage <= 1 ? "disabled" : "")>&lt;</button>
+                    <button type="button" id="nextPageBtn" class="btn btn-secondary btn-sm" @(Model.CurrentPage >= Model.TotalPages ? "disabled" : "")>&gt;</button>
+                    <button type="button" id="lastPageBtn" class="btn btn-secondary btn-sm" @(Model.CurrentPage >= Model.TotalPages ? "disabled" : "")>&raquo;</button>
                 </div>
             </div>
             <div class="table-list" id="table-list-container">
-                @{
-                    var startIndex = (Model.CurrentPage - 1) * Model.PageSize;
-                    var endIndex = Math.Min(startIndex + Model.PageSize, Model.Schema.Tables.Count);
-                }
-                @for (int i = startIndex; i < endIndex; i++)
+                @for (int i = 0; i < Model.Schema.Tables.Count; i++)
                 {
                     var t = Model.Schema.Tables[i];
                     var v = $"{t.Schema}.{t.Name}";
@@ -332,16 +339,27 @@
 
     // Pagination functionality
     (function () {
+        const firstBtn = document.getElementById('firstPageBtn');
         const prevBtn = document.getElementById('prevPageBtn');
         const nextBtn = document.getElementById('nextPageBtn');
+        const lastBtn = document.getElementById('lastPageBtn');
+        const pageSizeSelect = document.getElementById('pageSizeSelect');
         const tableListContainer = document.getElementById('table-list-container');
         const tableCount = @Model.Schema?.Tables.Count ?? 0;
-        const pageSize = @Model.PageSize;
-        const totalPages = @Model.TotalPages;
+        let pageSize = @Model.PageSize;
+        let totalPages = @Model.TotalPages;
         let currentPage = @Model.CurrentPage;
 
+        function getPageSize() {
+            if (!pageSizeSelect) return pageSize;
+            return pageSizeSelect.value === 'all' ? tableCount || 1 : parseInt(pageSizeSelect.value);
+        }
+
         function showPage(page) {
-            if (page < 1 || page > totalPages) return;
+            pageSize = getPageSize();
+            totalPages = Math.max(1, Math.ceil(tableCount / pageSize));
+            if (page < 1) page = 1;
+            if (page > totalPages) page = totalPages;
 
             const startIndex = (page - 1) * pageSize;
             const endIndex = Math.min(startIndex + pageSize, tableCount);
@@ -364,11 +382,17 @@
             currentPage = page;
 
             // Update button states
+            if (firstBtn) {
+                firstBtn.disabled = currentPage <= 1;
+            }
             if (prevBtn) {
                 prevBtn.disabled = currentPage <= 1;
             }
             if (nextBtn) {
                 nextBtn.disabled = currentPage >= totalPages;
+            }
+            if (lastBtn) {
+                lastBtn.disabled = currentPage >= totalPages;
             }
 
             // Update page info
@@ -378,11 +402,20 @@
             }
         }
 
+        if (firstBtn) {
+            firstBtn.addEventListener('click', () => showPage(1));
+        }
         if (prevBtn) {
             prevBtn.addEventListener('click', () => showPage(currentPage - 1));
         }
         if (nextBtn) {
             nextBtn.addEventListener('click', () => showPage(currentPage + 1));
+        }
+        if (lastBtn) {
+            lastBtn.addEventListener('click', () => showPage(totalPages));
+        }
+        if (pageSizeSelect) {
+            pageSizeSelect.addEventListener('change', () => showPage(1));
         }
 
         // Initialize - hide items not on current page

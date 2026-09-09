@@ -146,6 +146,21 @@ button {
     margin-left: auto;
 }
 
+.page-size-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: #6b7280;
+}
+
+.page-size-select {
+    padding: 4px 8px;
+    border: 1px solid #dfe5ed;
+    border-radius: 6px;
+    font-size: 13px;
+}
+
 .table-list {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));

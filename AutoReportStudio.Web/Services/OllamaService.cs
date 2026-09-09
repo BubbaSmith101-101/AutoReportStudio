@@ -225,6 +225,8 @@ GENERAL RULES
 * Never generate INSERT, UPDATE, DELETE, MERGE, DROP, ALTER, CREATE, TRUNCATE, EXEC, EXECUTE, or other data-changing statements.
 * For detail/tabular queries that could return many rows, use TOP (200).
 * Aggregated queries used for charts do not require TOP (200) unless the result could reasonably contain more than 200 groups.
+* If a section's heading or purpose states or implies a specific number of records, such as Top 20, Most Recent 10, or 50 Highest, the SQL's TOP (N) value MUST exactly match that stated number instead of the default 200.
+* Never state a specific record count in a heading or purpose unless the SQL's TOP (N) matches that count exactly.
 * Create between 2 and 6 useful report sections.
 
 CHART RULES
@@ -332,6 +334,11 @@ Before returning the plan, verify that:
 * The JSON is syntactically valid.
 * The response contains JSON and nothing else.
 * When reporting on a date field, I only want to see the date and not the time portion. Use CAST or CONVERT to ensure the time portion is removed.
+* Every bracketed identifier must be well-formed: each opening [ must be closed with a matching ] (e.g. [dateStamp]), never mixed with parentheses (e.g. [dateStamp)] is invalid).
+* Every opening parenthesis ( must have a matching closing parenthesis ), and brackets/parentheses must never be interleaved or swapped.
+* Double-check GROUP BY and ORDER BY clauses in particular, since expressions like DATEPART(WEEKDAY, [dateStamp]) are easy to mistype as DATEPART(WEEKDAY, [dateStamp)].
+* Re-read the full generated SQL string once more before returning the JSON to confirm every bracket and parenthesis pair is correctly matched.
+* For each section, if the heading or purpose mentions a specific record count, such as Top 20, confirm the SQL's TOP (N) matches that exact number; correct either the wording or the TOP (N) value so they agree.
 
 USER REQUEST:
 {request}

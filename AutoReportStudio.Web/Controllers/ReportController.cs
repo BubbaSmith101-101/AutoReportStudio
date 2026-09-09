@@ -24,12 +24,13 @@ public class ReportController : Controller
     }
 
     [HttpGet] 
-    public IActionResult Index()
+    public IActionResult Index(int page = 1)
     {
         logger.LogDebug("Entering Index action");
         try
         {
             var vm = new HomeVm();
+            vm.CurrentPage = page;
             var defaultConnection = config.GetConnectionString("DefaultConnection");
             if (!string.IsNullOrEmpty(defaultConnection))
             {

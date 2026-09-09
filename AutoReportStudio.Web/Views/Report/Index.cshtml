@@ -40,13 +40,22 @@
             <div class="table-select-actions">
                 <button type="button" id="selectAllTablesBtn" class="btn btn-secondary btn-sm">Select All</button>
                 <button type="button" id="clearAllTablesBtn" class="btn btn-secondary btn-sm">Clear All</button>
+                <div class="pagination-controls">
+                    <span class="page-info">Page @Model.CurrentPage of @Model.TotalPages (@Model.TotalItems tables)</span>
+                    <button type="button" id="prevPageBtn" class="btn btn-secondary btn-sm" @(Model.CurrentPage <= 1 ? "disabled" : "")>Previous</button>
+                    <button type="button" id="nextPageBtn" class="btn btn-secondary btn-sm" @(Model.CurrentPage >= Model.TotalPages ? "disabled" : "")>Next</button>
+                </div>
             </div>
-            <div class="grid">
-                @for (int i = 0; i < Model.Schema.Tables.Count; i++)
+            <div class="table-list" id="table-list-container">
+                @{
+                    var startIndex = (Model.CurrentPage - 1) * Model.PageSize;
+                    var endIndex = Math.Min(startIndex + Model.PageSize, Model.Schema.Tables.Count);
+                }
+                @for (int i = startIndex; i < endIndex; i++)
                 {
                     var t = Model.Schema.Tables[i];
                     var v = $"{t.Schema}.{t.Name}";
-                    <label class="choice">
+                    <label class="choice" data-table-index="@i">
                         <input type="checkbox" name="SelectedTables" value="@v" />
                         <b>@v</b>
                         <small>@t.Columns.Count columns · @t.ForeignKeys.Count relationships</small>
@@ -320,4 +329,63 @@
             processingStatus.textContent = 'Connecting...';
         }
     }
+
+    // Pagination functionality
+    (function () {
+        const prevBtn = document.getElementById('prevPageBtn');
+        const nextBtn = document.getElementById('nextPageBtn');
+        const tableListContainer = document.getElementById('table-list-container');
+        const tableCount = @Model.Schema?.Tables.Count ?? 0;
+        const pageSize = @Model.PageSize;
+        const totalPages = @Model.TotalPages;
+        let currentPage = @Model.CurrentPage;
+
+        function showPage(page) {
+            if (page < 1 || page > totalPages) return;
+
+            const startIndex = (page - 1) * pageSize;
+            const endIndex = Math.min(startIndex + pageSize, tableCount);
+
+            // Hide all table items first
+            const allLabels = tableListContainer.querySelectorAll('.choice');
+            allLabels.forEach(label => {
+                label.style.display = 'none';
+            });
+
+            // Show only items for current page
+            for (let i = startIndex; i < endIndex; i++) {
+                const label = tableListContainer.querySelector(`.choice[data-table-index="${i}"]`);
+                if (label) {
+                    label.style.display = '';
+                }
+            }
+
+            // Update active page
+            currentPage = page;
+
+            // Update button states
+            if (prevBtn) {
+                prevBtn.disabled = currentPage <= 1;
+            }
+            if (nextBtn) {
+                nextBtn.disabled = currentPage >= totalPages;
+            }
+
+            // Update page info
+            const pageInfo = document.querySelector('.page-info');
+            if (pageInfo) {
+                pageInfo.textContent = `Page ${currentPage} of ${totalPages} (${tableCount} tables)`;
+            }
+        }
+
+        if (prevBtn) {
+            prevBtn.addEventListener('click', () => showPage(currentPage - 1));
+        }
+        if (nextBtn) {
+            nextBtn.addEventListener('click', () => showPage(currentPage + 1));
+        }
+
+        // Initialize - hide items not on current page
+        showPage(currentPage);
+    })();
 </script>

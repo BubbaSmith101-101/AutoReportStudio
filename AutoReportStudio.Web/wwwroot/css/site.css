@@ -139,6 +139,19 @@ button {
     margin-bottom: 12px;
 }
 
+.pagination-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-left: auto;
+}
+
+.table-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 10px;
+}
+
 .btn-sm {
     padding: 6px 14px;
     margin-top: 0;

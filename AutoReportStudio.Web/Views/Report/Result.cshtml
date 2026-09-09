@@ -52,7 +52,7 @@
 @{ int chartIndex = 0; }
 @foreach (var s in Model.Sections)
 {
-    <details class="card section-card" open>
+    <details class="card section-card" data-section-index="@chartIndex" data-page-size="@s.PageSize" data-total-items="@s.Rows.Count" open>
         <summary class="section-summary"><h2>@s.Heading</h2></summary>
         <p>@s.Purpose</p>
         @if (string.Equals(s.Type, "chart", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(s.XAxis) && !string.IsNullOrEmpty(s.YAxis) && s.Columns.Count > 0)
@@ -144,18 +144,27 @@
         }
         else if (s.Columns.Count > 0)
         {
+            <div class="pagination-controls">
+                <span class="page-info">Page @s.CurrentPage of @s.TotalPages (@s.TotalItems rows)</span>
+                <button type="button" class="prev-page-btn btn btn-secondary btn-sm" data-section-index="@chartIndex" @(s.CurrentPage <= 1 ? "disabled" : "")>Previous</button>
+                <button type="button" class="next-page-btn btn btn-secondary btn-sm" data-section-index="@chartIndex" @(s.CurrentPage >= s.TotalPages ? "disabled" : "")>Next</button>
+            </div>
             <div class="scroll"><table><thead><tr>@foreach(var c in s.Columns){
                 <th>@c</th>
         }
-        </tr></thead><tbody>@foreach(var row in s.Rows){
-        <tr>@foreach(var x in row){
-            <td>@FormatCell(x)</td>
+        </tr></thead><tbody>
+            @foreach(var row in s.Rows){
+                var rowIndex = s.Rows.IndexOf(row);
+                var visible = rowIndex >= (s.CurrentPage - 1) * s.PageSize && rowIndex < s.CurrentPage * s.PageSize;
+                <tr style="@(visible ? "" : "display: none;")">
+                    @foreach(var x in row){
+                        <td>@FormatCell(x)</td>
+                }
+                </tr>
+            }
+            </tbody></table></div>
         }
-    </tr>
-}
-</tbody></table></div>
-        }
-<details><summary>Generated SQL</summary><pre>@s.Sql</pre></details>
+        <details><summary>Generated SQL</summary><pre>@s.Sql</pre></details>
 </details>
 }
 
@@ -167,4 +176,90 @@
             btn.classList.toggle('visible', window.scrollY > 400);
         });
     })();
-</script>
+
+        // Report pagination functionality
+        (function () {
+            function showPage(section, page) {
+                const rowsContainer = section.querySelector('.scroll table tbody');
+                if (!rowsContainer) return;
+
+                // Get all rows (including hidden ones)
+                const allRows = rowsContainer.querySelectorAll('tr');
+                const pageSize = parseInt(section.dataset.pageSize) || 50;
+                const totalRows = allRows.length;
+                const totalPages = Math.ceil(totalRows / pageSize);
+
+                if (page < 1 || page > totalPages || totalRows === 0) return;
+
+                const startIndex = (page - 1) * pageSize;
+                const endIndex = Math.min(startIndex + pageSize, totalRows);
+
+                // Hide all rows first
+                allRows.forEach((row, index) => {
+                    row.style.display = index >= startIndex && index < endIndex ? '' : 'none';
+                });
+
+                // Update page info
+                const pageInfo = section.querySelector('.page-info');
+                if (pageInfo) {
+                    pageInfo.textContent = `Page ${page} of ${totalPages} (${totalRows} rows)`;
+                }
+
+                // Update button states
+                const prevBtn = section.querySelector('.prev-page-btn');
+                const nextBtn = section.querySelector('.next-page-btn');
+                if (prevBtn) {
+                    prevBtn.disabled = page <= 1;
+                }
+                if (nextBtn) {
+                    nextBtn.disabled = page >= totalPages;
+                }
+
+                // Update section data attributes
+                section.dataset.currentPage = page;
+                section.dataset.totalRows = totalRows;
+                section.dataset.totalPages = totalPages;
+
+                // Scroll to top of the table
+                const scrollDiv = section.querySelector('.scroll');
+                if (scrollDiv) {
+                    scrollDiv.scrollTop = 0;
+                }
+            }
+
+            // Set up event listeners for pagination buttons
+            document.addEventListener('click', function (e) {
+                if (e.target.matches('.prev-page-btn, .next-page-btn')) {
+                    const button = e.target;
+                    const section = button.closest('details');
+                    if (!section) return;
+
+                    let page = parseInt(section.dataset.currentPage || 1);
+                    if (button.classList.contains('prev-page-btn')) {
+                        page--;
+                    } else if (button.classList.contains('next-page-btn')) {
+                        page++;
+                    }
+
+                    showPage(section, page);
+                }
+            });
+
+            // Initialize pagination for all sections
+            document.querySelectorAll('details[data-section-index]').forEach((section) => {
+                const table = section.querySelector('.scroll table tbody');
+                if (table) {
+                    const allRows = table.querySelectorAll('tr');
+                    const pageSize = parseInt(section.dataset.pageSize) || 50;
+                    const totalPages = Math.ceil(allRows.length / pageSize);
+
+                    section.dataset.totalRows = allRows.length;
+                    section.dataset.totalPages = totalPages;
+                    section.dataset.currentPage = 1;
+
+                    // Show first page by default
+                    showPage(section, 1);
+                }
+            });
+        })();
+    </script>

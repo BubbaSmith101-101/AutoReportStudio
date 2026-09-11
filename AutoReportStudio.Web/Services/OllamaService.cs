@@ -1,5 +1,7 @@
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Linq;
 using AutoReportStudio.Web.Models;
 namespace AutoReportStudio.Web.Services;
 
@@ -8,6 +10,160 @@ public class OllamaGenerationResult
 {
     public string Text { get; set; } = "";
     public long TokensGenerated { get; set; } = 0;
+}
+
+static class SqlValidator
+{
+    public static void ValidateAndRepairPlan(ReportPlan plan, DbSchema schema, ILogger logger)
+    {
+        if (plan == null || schema == null) return;
+
+        DbTable? FindTable(string sch, string name)
+        {
+            return schema.Tables.FirstOrDefault(t => string.Equals(t.Schema, sch, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase));
+        }
+
+        string? MatchColumnName(string target, List<DbColumn> cols)
+        {
+            if (cols == null) return null;
+
+            // Exact match ONLY - no fuzzy matching
+            var match = cols.FirstOrDefault(c => string.Equals(c.Name, target, StringComparison.OrdinalIgnoreCase));
+            if (match != null) return match.Name;
+
+            // No repair - column not found exactly
+            return null;
+        }
+
+        var tableAliasRegex = new Regex(@"\b(?:FROM|JOIN)\s+\[([^\]]+)\]\.\[([^\]]+)\]\s+(?:AS\s+)?([A-Za-z0-9_]+)", RegexOptions.IgnoreCase);
+        var aliasColRegex = new Regex(@"\b([A-Za-z0-9_]+)\.\[([^\]]+)\]", RegexOptions.IgnoreCase);
+        var unqualifiedColRegex = new Regex(@"\[([^\]]+)\](?=\s*(?:,|FROM|WHERE|GROUP|ORDER|HAVING|;|$))", RegexOptions.IgnoreCase);
+
+        foreach (var sec in plan.Sections)
+        {
+            if (string.IsNullOrWhiteSpace(sec.Sql)) continue;
+            var sql = sec.Sql;
+            var aliasMap = new Dictionary<string, (string sch, string tbl)>();
+            foreach (Match m in tableAliasRegex.Matches(sql))
+            {
+                aliasMap[m.Groups[3].Value] = (m.Groups[1].Value, m.Groups[2].Value);
+            }
+
+            var repaired = sql;
+            var madeChange = false;
+
+            // Check alias-qualified columns
+            foreach (Match m in aliasColRegex.Matches(sql))
+            {
+                var alias = m.Groups[1].Value;
+                var col = m.Groups[2].Value;
+                if (!aliasMap.ContainsKey(alias)) continue;
+                var (sch, tbl) = aliasMap[alias];
+                var table = FindTable(sch, tbl);
+                if (table == null) continue;
+                var found = table.Columns.FirstOrDefault(c => string.Equals(c.Name, col, StringComparison.OrdinalIgnoreCase));
+                if (found != null) continue;
+                var candidate = MatchColumnName(col, table.Columns);
+                if (!string.IsNullOrEmpty(candidate))
+                {
+                    var oldToken = $"{alias}.[{col}]";
+                    var newToken = $"{alias}.[{candidate}]";
+                    repaired = repaired.Replace(oldToken, newToken);
+                    logger.LogInformation("Repaired column reference in section '{Heading}': {Old} -> {New}", sec.Heading, oldToken, newToken);
+                    madeChange = true;
+                }
+                else
+                {
+                    logger.LogWarning("Missing column '{Col}' for table {Schema}.{Table} (alias {Alias}) in generated SQL for section '{Heading}'. Check if this is a typo or if the column exists in the schema.", col, sch, tbl, alias, sec.Heading);
+                }
+            }
+
+            if (madeChange) sec.Sql = repaired;
+        }
+    }
+
+    public static string? GetInvalidColumnErrors(ReportPlan plan, DbSchema schema, ILogger logger)
+    {
+        if (plan == null || schema == null) return null;
+
+        DbTable? FindTable(string sch, string name)
+        {
+            return schema.Tables.FirstOrDefault(t => string.Equals(t.Schema, sch, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase));
+        }
+
+        var tableAliasRegex = new Regex(@"\b(?:FROM|JOIN)\s+\[([^\]]+)\]\.\[([^\]]+)\]\s+(?:AS\s+)?([A-Za-z0-9_]+)", RegexOptions.IgnoreCase);
+        var cteNameRegex = new Regex(@"\bWITH\s+([A-Za-z0-9_]+)\s+AS\s*\(", RegexOptions.IgnoreCase);
+        var aliasColRegex = new Regex(@"\b([A-Za-z0-9_]+)\.\[([^\]]+)\]", RegexOptions.IgnoreCase);
+        var unqualifiedInJoinRegex = new Regex(@"\bON\s+([^\=]+)\s*=", RegexOptions.IgnoreCase);
+        var errors = new System.Text.StringBuilder();
+
+        foreach (var sec in plan.Sections)
+        {
+            if (string.IsNullOrWhiteSpace(sec.Sql)) continue;
+            var sql = sec.Sql;
+            var aliasMap = new Dictionary<string, (string sch, string tbl)>();
+
+            // Find CTE names
+            var cteNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (Match m in cteNameRegex.Matches(sql))
+            {
+                cteNames.Add(m.Groups[1].Value);
+            }
+
+            // Find table aliases from FROM/JOIN
+            foreach (Match m in tableAliasRegex.Matches(sql))
+            {
+                aliasMap[m.Groups[3].Value] = (m.Groups[1].Value, m.Groups[2].Value);
+            }
+
+            // Check for alias-qualified columns
+            foreach (Match m in aliasColRegex.Matches(sql))
+            {
+                var alias = m.Groups[1].Value;
+                var col = m.Groups[2].Value;
+
+                // Skip if it's a CTE reference or known alias
+                if (cteNames.Contains(alias)) continue;
+
+                if (!aliasMap.ContainsKey(alias))
+                {
+                    errors.AppendLine($"Section '{sec.Heading}': Undefined table alias '{alias}' in reference {alias}.[{col}]. All tables must be aliased in FROM/JOIN clauses.");
+                    continue;
+                }
+
+                var (sch, tbl) = aliasMap[alias];
+                var table = FindTable(sch, tbl);
+
+                if (table == null)
+                {
+                    errors.AppendLine($"Section '{sec.Heading}': Table {sch}.{tbl} not found in schema");
+                    continue;
+                }
+
+                var found = table.Columns.FirstOrDefault(c => string.Equals(c.Name, col, StringComparison.OrdinalIgnoreCase));
+                if (found == null)
+                {
+                    var validCols = string.Join(", ", table.Columns.Select(c => c.Name).OrderBy(x => x));
+                    errors.AppendLine($"Section '{sec.Heading}': Invalid column '{col}' in table {sch}.{tbl}. Valid columns are: {validCols}");
+                }
+            }
+
+            // Check for unqualified columns in JOIN ON clauses
+            foreach (Match m in unqualifiedInJoinRegex.Matches(sql))
+            {
+                var joinCondition = m.Groups[1].Value.Trim();
+                // Look for unqualified column references (no dot before bracket)
+                if (System.Text.RegularExpressions.Regex.IsMatch(joinCondition, @"\b(?<!\.)(?<![A-Za-z0-9_])\["))
+                {
+                    errors.AppendLine($"Section '{sec.Heading}': Unqualified column reference in JOIN ON clause: '{joinCondition}'. All columns in JOIN conditions must use table aliases (e.g., e.[EmployeeID], not [EmployeeID])");
+                }
+            }
+        }
+
+        return errors.Length > 0 ? errors.ToString() : null;
+    }
 }
 
 // Response shape returned by the Ollama /api/generate endpoint
@@ -191,6 +347,27 @@ public class OllamaService : IOllamaService
         }
     }
 
+    private static string BuildColumnReferenceGuide(DbSchema schema)
+    {
+        if (schema?.Tables == null || schema.Tables.Count == 0)
+            return "No tables available in schema.";
+
+        var sb = new System.Text.StringBuilder();
+        foreach (var table in schema.Tables.OrderBy(t => t.Name))
+        {
+            sb.AppendLine($"[{table.Schema}].[{table.Name}]");
+            if (table.Columns != null && table.Columns.Count > 0)
+            {
+                foreach (var col in table.Columns.OrderBy(c => c.Name))
+                {
+                    sb.AppendLine($"  - [{col.Name}] ({col.Type})" + (col.PrimaryKey ? " [PK]" : ""));
+                }
+            }
+            sb.AppendLine();
+        }
+        return sb.ToString();
+    }
+
     public async Task<ReportPlan> Plan(DbSchema schema, string request, string? selectedModel = null, CancellationToken ct = default)
     {
         logger.LogDebug("Entering Plan method");
@@ -209,6 +386,7 @@ GENERAL RULES
   
   1. Ensure that the following error does not occur: Operand type clash: date is incompatible with int.
   2. Ensure that you do not use ambiguous column names in your SQL queries, for example 'MonthLabel'.
+  3. When constructing JOIN clauses, prefer using declared foreign keys from the supplied schema. If a foreign key exists between two tables, use its Column and RefColumn exactly for the ON clause (for example: ON e.[EmployeeStatusTypeId] = s.[Id]). Never invent or guess join column names; only use column names that appear in the supplied schema JSON.
 
 * Do not include Markdown.
 * Do not include ```json code fences.
@@ -216,7 +394,38 @@ GENERAL RULES
 * Use ONLY tables and columns that exist in the supplied schema.
 * Never invent tables, columns, relationships, or data.
 * Use fully qualified bracketed SQL Server table names, for example [dbo].[Employees].
+
+CRITICAL COLUMN SELECTION RULES
+
+* NEVER guess or invent column names. Every column name you write MUST exist in the supplied schema for its table.
+* Before using any column in your SQL, verify it exists in the schema by checking the Columns array for that table.
+* If you intend to join on a relationship, ALWAYS check the ForeignKeys array first. Use the exact Column and RefColumn names specified in the foreign key (e.g., if a foreign key shows Column: EmployeeStatusTypeId and RefColumn: Id, write: ON e.[EmployeeStatusTypeId] = s.[Id], NOT e.[StatusID] or e.[Status_Id]).
+* Do not attempt to derive or abbreviate column names. For example:
+  - WRONG: e.[StatusID] (this column may not exist; the actual FK column might be EmployeeStatusTypeId)
+  - CORRECT: e.[EmployeeStatusTypeId] (use the exact name from the schema)
+* If the schema shows a column named EmployeeStatusTypeId but not StatusID, you must use EmployeeStatusTypeId.
+* Every column reference must be wrapped in square brackets [ColumnName] for safety.
+* When in doubt, copy the exact column name directly from the supplied schema JSON.
 * Every SQL query must be read-only.
+
+MANDATORY TABLE ALIAS RULES
+
+* EVERY table in a FROM or JOIN clause MUST have a table alias defined.
+  - WRONG: FROM [dbo].[Employee] WHERE [EmployeeID] = 1
+  - CORRECT: FROM [dbo].[Employee] e WHERE e.[EmployeeID] = 1
+* EVERY column reference MUST be qualified with its table alias.
+  - WRONG: SELECT [EmployeeID], [FirstName] FROM [dbo].[Employee] e
+  - CORRECT: SELECT e.[EmployeeID], e.[FirstName] FROM [dbo].[Employee] e
+* In JOIN ON conditions, BOTH sides must use table aliases:
+  - WRONG: ON EmployeeID = StatusID
+  - WRONG: ON [EmployeeID] = est.[StatusID]
+  - CORRECT: ON e.[EmployeeStatusTypeId] = est.[Id]
+* Alias names should be short (e.g., e, emp, est, status) and used consistently throughout the query.
+* In GROUP BY and ORDER BY clauses, use the alias-qualified column name:
+  - WRONG: GROUP BY [StatusName]
+  - CORRECT: GROUP BY est.[StatusName]
+* Every column must be unique and unambiguous. If the same column name exists in multiple tables, you MUST use the alias to disambiguate.
+
 * The work week runs from Sunday through Saturday.
 * Every query must be either:
 
@@ -293,6 +502,35 @@ When generating SQL for a chart:
 * Aggregate the data when necessary using COUNT, SUM, AVG, MIN, or MAX.
 * Protect calculations from divide-by-zero errors when applicable.
 * Do not reference schema elements that were not supplied.
+* CRITICAL: Never nest aggregate functions. For example, do NOT write AVG(CAST(COUNT(*) AS float)) or SUM(AVG(...)). If you need to compute an average of counts, use a CTE or a subquery. Example: WITH counts AS (SELECT category, COUNT(*) as cnt FROM table GROUP BY category) SELECT category, AVG(cnt * 1.0) FROM counts GROUP BY category.
+* If a query returns zero rows, it means either the WHERE/JOIN conditions are too restrictive, the columns do not exist, or the foreign keys are wrong. Always verify that your JOINs reference actual foreign keys from the schema and that your WHERE conditions use columns with values.
+
+WORKING SQL EXAMPLES FOR COMMON JOINS
+
+For grouping by a status type:
+SELECT est.[StatusName] AS [Status], COUNT(*) AS [Count]
+FROM [dbo].[Employee] e
+INNER JOIN [dbo].[EmployeeStatusType] est ON e.[EmployeeStatusTypeId] = est.[Id]
+WHERE e.[IsActive] = 1
+GROUP BY est.[StatusName]
+ORDER BY [Count] DESC
+
+For counting active employees:
+SELECT COUNT(*) AS [ActiveCount]
+FROM [dbo].[Employee] e
+WHERE e.[IsActive] = 1
+
+For joining with status to get employee details:
+SELECT e.[EmployeeID], e.[FirstName], e.[LastName], est.[StatusName]
+FROM [dbo].[Employee] e
+INNER JOIN [dbo].[EmployeeStatusType] est ON e.[EmployeeStatusTypeId] = est.[Id]
+WHERE e.[IsActive] = 1
+
+The above examples show correct column usage. Notice:
+- Employee table columns: EmployeeID, FirstName, LastName, EmployeeStatusTypeId, IsActive
+- EmployeeStatusType table columns: Id, StatusName
+- Correct JOIN condition: e.[EmployeeStatusTypeId] = est.[Id]
+- Never use: StatusID, Status_Id, or other variations
 
 EXAMPLE OUTPUT SHAPE
 {{
@@ -339,11 +577,20 @@ Before returning the plan, verify that:
 * Double-check GROUP BY and ORDER BY clauses in particular, since expressions like DATEPART(WEEKDAY, [dateStamp]) are easy to mistype as DATEPART(WEEKDAY, [dateStamp)].
 * Re-read the full generated SQL string once more before returning the JSON to confirm every bracket and parenthesis pair is correctly matched.
 * For each section, if the heading or purpose mentions a specific record count, such as Top 20, confirm the SQL's TOP (N) matches that exact number; correct either the wording or the TOP (N) value so they agree.
+* Every SQL query in every section must be tested mentally: does the WHERE clause correctly filter data, are the JOINs using valid foreign keys, will the GROUP BY produce meaningful groups, and will the result set contain at least one row if the table is not empty?
+* NO nested aggregate functions are permitted. If the design requires averaging a count or summing a sum, use a CTE with a subquery first.
+* Ensure that all date-range filters (such as DATEADD(DAY, -90, CAST(GETDATE() AS DATE))) use the correct offset direction; the example (DAY, -90, ...) means 90 days in the past.
+
+COLUMN REFERENCE GUIDE
+
+The following table lists each table's name and its actual columns. Use ONLY these exact column names in your SQL:
+
+{BuildColumnReferenceGuide(schema)}
 
 USER REQUEST:
 {request}
 
-SUPPLIED SCHEMA:
+SUPPLIED SCHEMA (JSON):
 {JsonSerializer.Serialize(schema)}
 ";
 
@@ -352,6 +599,24 @@ SUPPLIED SCHEMA:
 
             var plan = JsonSerializer.Deserialize<ReportPlan>(txt, new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? throw new Exception("Invalid Ollama report plan.");
             logger.LogInformation("Report plan generated successfully with {SectionCount} sections", plan.Sections.Count);
+
+            // Validate and attempt to repair SQL using the supplied schema to avoid invalid column/table names
+            try
+            {
+                SqlValidator.ValidateAndRepairPlan(plan, schema, logger);
+
+                // Check for any remaining invalid columns
+                var errors = SqlValidator.GetInvalidColumnErrors(plan, schema, logger);
+                if (!string.IsNullOrEmpty(errors))
+                {
+                    logger.LogWarning("Generated SQL contains invalid columns:\n{Errors}", errors);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Validation/repair of generated SQL failed: {Message}", ex.Message);
+            }
+
             return plan;
         }
         catch (Exception ex)

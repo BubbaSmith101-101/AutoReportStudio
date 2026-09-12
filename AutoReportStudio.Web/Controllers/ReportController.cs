@@ -66,6 +66,27 @@ public class ReportController : Controller
         }
     }
 
+    [HttpGet]
+    public async Task<IActionResult> GetModelMaxContext(string model, CancellationToken ct)
+    {
+        logger.LogDebug("Entering GetModelMaxContext action for model: {Model}", model);
+        try
+        {
+            var maxContext = await ollama.GetModelMaxContext(model, ct);
+            logger.LogInformation("Retrieved max context length: {MaxContext}", maxContext);
+            return Json(maxContext);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error retrieving max context length: {ErrorMessage}", ex.Message);
+            return Json(0);
+        }
+        finally
+        {
+            logger.LogDebug("Exiting GetModelMaxContext action");
+        }
+    }
+
     [HttpPost]
     [ValidateAntiForgeryToken] 
     public async Task<IActionResult> Discover(HomeVm m, CancellationToken ct)
@@ -98,16 +119,57 @@ public class ReportController : Controller
             // Reset token counter for this report generation
             ollama.ResetTokenCount();
 
-            logger.LogDebug("Generating report with {TableCount} tables and model {SelectedModel}", m.SelectedTables.Count, m.SelectedModel);
-            var r = await reports.Generate(m.ConnectionString, m.SelectedTables, m.Request, m.SelectedModel, ct); 
+            // Get context length percentage from form (slider value)
+            int? contextLengthPercent = null;
+            if (!string.IsNullOrEmpty(m.ContextLengthPercent))
+            {
+                contextLengthPercent = int.Parse(m.ContextLengthPercent);
+            }
+
+            // Get timeout minutes from form (slider value)
+            int? timeoutMinutes = null;
+            if (!string.IsNullOrEmpty(m.TimeoutMinutes))
+            {
+                timeoutMinutes = int.Parse(m.TimeoutMinutes);
+            }
+
+            logger.LogDebug("Generating report with {TableCount} tables, model {SelectedModel}, context length {ContextLengthPercent}%, timeout {TimeoutMinutes} minutes", m.SelectedTables.Count, m.SelectedModel, contextLengthPercent ?? 75, timeoutMinutes ?? 3);
+            var r = await reports.Generate(m.ConnectionString, m.SelectedTables, m.Request, m.SelectedModel, ct, contextLengthPercent, timeoutMinutes);
             TempData["Report"] = JsonSerializer.Serialize(r); 
             logger.LogInformation("Report generated successfully");
             return View("Result", r); 
         } 
         catch (Exception ex) 
         { 
-            m.Error = ex.Message;
-            logger.LogError(ex, "Error during report generation: {ErrorMessage}", ex.Message);
+            // Build more informative error message with source information
+            string errorMessage = ex.Message;
+            string errorSource = "Unknown";
+
+            // Determine error source
+            if (ex.Message.Contains("Ollama"))
+            {
+                errorSource = "Ollama LLM Service";
+            }
+            else if (ex.Message.Contains("connection"))
+            {
+                errorSource = "Database Connection";
+            }
+            else if (ex.Message.Contains("JSON"))
+            {
+                errorSource = "Response Parsing (LLM)";
+            }
+            else if (ex.InnerException is JsonException)
+            {
+                errorSource = "LLM Response Format (JSON parsing failed)";
+                errorMessage = $"The LLM returned invalid JSON. This typically means the model output couldn't be parsed as expected. Original error: {ex.InnerException.Message}";
+            }
+            else if (ex.Message.Contains("timeout") || ex.Message.Contains("Timeout"))
+            {
+                errorSource = "Request Timeout";
+            }
+
+            m.Error = $"[{errorSource}] {errorMessage}";
+            logger.LogError(ex, "Error during report generation from {ErrorSource}: {ErrorMessage}", errorSource, errorMessage);
             try 
             { 
                 m.Schema = await schema.Discover(m.ConnectionString, ct); 

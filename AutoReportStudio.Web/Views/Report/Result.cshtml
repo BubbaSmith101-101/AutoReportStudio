@@ -95,8 +95,31 @@
             <span class="metric-value">@(string.IsNullOrEmpty(Model.ModelUsed) ? "Default" : Model.ModelUsed)</span>
         </div>
         <div class="metric">
+            <span class="metric-label">Model Max Context</span>
+            <span class="metric-value" title="Maximum context length supported by the selected model">@(Model.ModelMaxContextLength > 0 ? Model.ModelMaxContextLength.ToString("N0") + " tokens" : "Unknown")</span>
+        </div>
+        <div class="metric">
             <span class="metric-label">Configured Context Length</span>
             <span class="metric-value">@(Model.ConfiguredContextLength > 0 ? Model.ConfiguredContextLength.ToString("N0") + " tokens" : "Unknown")</span>
+        </div>
+        <div class="metric">
+            <span class="metric-label">Context % of Max</span>
+            <span class="metric-value">
+                @if (Model.ModelMaxContextLength > 0 && Model.ConfiguredContextLength > 0)
+                {
+                    var percentage = (double)Model.ConfiguredContextLength / Model.ModelMaxContextLength * 100;
+                    @percentage.ToString("F1")<text>%</text> 
+                    <span style="font-size: 12px; color: #666;">(<text>@percentage.ToString("F0")</text>% of max)</span>
+                }
+                else
+                {
+                    @:Unknown
+                }
+            </span>
+        </div>
+        <div class="metric">
+            <span class="metric-label">Configured Timeout</span>
+            <span class="metric-value">@(Model.ConfiguredTimeoutSeconds > 0 ? (Model.ConfiguredTimeoutSeconds / 60) + " minute" + ((Model.ConfiguredTimeoutSeconds / 60) != 1 ? "s" : "") : "Unknown")</span>
         </div>
         <div class="metric metric-wide">
             <span class="metric-label">Instructions</span>

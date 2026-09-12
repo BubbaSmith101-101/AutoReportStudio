@@ -418,12 +418,13 @@ public interface IOllamaService
 { 
     Task<List<string>> ListModels(CancellationToken ct = default);
     Task<List<OllamaModelInfo>> ListModelsWithDetails(CancellationToken ct = default);
-    Task<ReportPlan> Plan(DbSchema schema, string request, string? selectedModel = null, CancellationToken ct = default, string? connectionString = null); 
-    Task<string> Summarize(ReportResult report, string? selectedModel = null, CancellationToken ct = default);
+    Task<ReportPlan> Plan(DbSchema schema, string request, string? selectedModel = null, CancellationToken ct = default, string? connectionString = null, int? contextLengthPercent = null, int? timeoutMinutes = null);
+    Task<string> Summarize(ReportResult report, string? selectedModel = null, CancellationToken ct = default, int? contextLengthPercent = null, int? timeoutMinutes = null);
     long GetTotalTokensGenerated();
     void ResetTokenCount();
     int GetLastModelMaxContextLength();
     int GetLastConfiguredContextLength();
+    Task<int> GetModelMaxContext(string model, CancellationToken ct = default);
 }
 
 public class OllamaService : IOllamaService
@@ -460,6 +461,17 @@ public class OllamaService : IOllamaService
     public int GetLastModelMaxContextLength() => lastModelMaxContextLength;
 
     public int GetLastConfiguredContextLength() => lastConfiguredContextLength;
+
+    /// <summary>
+    /// Public on-demand lookup of a model's maximum context length, used by the UI to size
+    /// the context-length slider before a report has been generated.
+    /// </summary>
+    public async Task<int> GetModelMaxContext(string model, CancellationToken ct = default)
+    {
+        var url = (cfg["Ollama:BaseUrl"] ?? "http://localhost:11434").TrimEnd('/');
+        return await GetModelMaxContextLength(model, url, ct);
+    }
+
 
     // Caches each model's maximum context length (num_ctx) so we don't call /api/show on every request.
     private static readonly Dictionary<string, int> ModelMaxContextCache = new(StringComparer.OrdinalIgnoreCase);
@@ -511,13 +523,21 @@ public class OllamaService : IOllamaService
                 }
             }
 
-            logger.LogInformation("Resolved max context length for model '{Model}': {MaxContext} tokens.", model, maxCtx);
+            logger.LogInformation("Resolved max context length for model '{Model}': {MaxContext} tokens. URL: {Url}", model, maxCtx, url);
             ModelMaxContextCache[model] = maxCtx;
             return maxCtx;
         }
+        catch (JsonException jsonEx)
+        {
+            logger.LogError(jsonEx, "Failed to parse model info response for '{Model}' from {Url}. Response parsing error: {ErrorMessage}", model, url, jsonEx.Message);
+            const int fallback = 8192;
+            ModelMaxContextCache[model] = fallback;
+            return fallback;
+        }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "Failed to resolve max context length for model '{Model}'; defaulting num_ctx to 8192.", model);
+            logger.LogError(ex, "Failed to resolve max context length for model '{Model}' from {Url}. Exception type: {ExceptionType}, ErrorMessage: {ErrorMessage}. Defaulting to 8192 tokens.", 
+                model, url, ex.GetType().Name, ex.Message);
             const int fallback = 8192;
             ModelMaxContextCache[model] = fallback;
             return fallback;
@@ -570,12 +590,20 @@ public class OllamaService : IOllamaService
         }
         catch (HttpRequestException ex)
         {
-            logger.LogWarning(ex, "Failed to connect to Ollama for listing models");
+            logger.LogError(ex, "Failed to connect to Ollama at {Url} for listing models. URL: {FullUrl}, ErrorMessage: {ErrorMessage}", 
+                cfg["Ollama:BaseUrl"] ?? "http://localhost:11434", (cfg["Ollama:BaseUrl"] ?? "http://localhost:11434") + "/api/tags", ex.Message);
+            return new List<string>();
+        }
+        catch (JsonException jsonEx)
+        {
+            logger.LogError(jsonEx, "Failed to parse models list response from Ollama. URL: {Url}, ErrorMessage: {ErrorMessage}", 
+                cfg["Ollama:BaseUrl"] ?? "http://localhost:11434", jsonEx.Message);
             return new List<string>();
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error listing models from Ollama: {ErrorMessage}", ex.Message);
+            logger.LogError(ex, "Error listing models from Ollama at {Url}. Exception type: {ExceptionType}, ErrorMessage: {ErrorMessage}", 
+                cfg["Ollama:BaseUrl"] ?? "http://localhost:11434", ex.GetType().Name, ex.Message);
             return new List<string>();
         }
         finally
@@ -643,12 +671,20 @@ public class OllamaService : IOllamaService
         }
         catch (HttpRequestException ex)
         {
-            logger.LogWarning(ex, "Failed to connect to Ollama for listing models with details");
+            logger.LogError(ex, "Failed to connect to Ollama at {Url} for listing models with details. URL: {FullUrl}, ErrorMessage: {ErrorMessage}", 
+                cfg["Ollama:BaseUrl"] ?? "http://localhost:11434", (cfg["Ollama:BaseUrl"] ?? "http://localhost:11434") + "/api/tags", ex.Message);
+            return new List<OllamaModelInfo>();
+        }
+        catch (JsonException jsonEx)
+        {
+            logger.LogError(jsonEx, "Failed to parse models with details response from Ollama at {Url}. ErrorMessage: {ErrorMessage}", 
+                cfg["Ollama:BaseUrl"] ?? "http://localhost:11434", jsonEx.Message);
             return new List<OllamaModelInfo>();
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error listing models with details from Ollama: {ErrorMessage}", ex.Message);
+            logger.LogError(ex, "Error listing models with details from Ollama at {Url}. Exception type: {ExceptionType}, ErrorMessage: {ErrorMessage}", 
+                cfg["Ollama:BaseUrl"] ?? "http://localhost:11434", ex.GetType().Name, ex.Message);
             return new List<OllamaModelInfo>();
         }
         finally
@@ -683,9 +719,32 @@ public class OllamaService : IOllamaService
         return sb.ToString();
     }
 
-    public async Task<ReportPlan> Plan(DbSchema schema, string request, string? selectedModel = null, CancellationToken ct = default, string? connectionString = null)
+    /// <summary>
+    /// Extracts JSON from a response that may contain explanatory text before/after the JSON.
+    /// Finds the first { and last } and returns the content between them.
+    /// </summary>
+    private static string ExtractJsonFromResponse(string response)
     {
-        logger.LogDebug("Entering Plan method");
+        if (string.IsNullOrWhiteSpace(response))
+            return response;
+
+        // Find the first opening brace
+        int startIndex = response.IndexOf('{');
+        if (startIndex < 0)
+            return response; // No JSON found, return as-is
+
+        // Find the last closing brace
+        int endIndex = response.LastIndexOf('}');
+        if (endIndex < 0 || endIndex < startIndex)
+            return response; // No matching closing brace, return as-is
+
+        // Extract JSON substring
+        return response.Substring(startIndex, endIndex - startIndex + 1);
+    }
+
+    public async Task<ReportPlan> Plan(DbSchema schema, string request, string? selectedModel = null, CancellationToken ct = default, string? connectionString = null, int? contextLengthPercent = null, int? timeoutMinutes = null)
+    {
+        logger.LogDebug("Entering Plan method with timeoutMinutes: {TimeoutMinutes}", timeoutMinutes ?? 3);
         try
         {
             logger.LogInformation("Generating report plan with request: {Request}", request);
@@ -694,9 +753,13 @@ public class OllamaService : IOllamaService
 
 Your job is to analyze the user's reporting request and create a report plan using ONLY the supplied database schema.
 
+CRITICAL: YOU MUST RESPOND WITH ONLY VALID JSON. NO EXPLANATIONS, NO PREAMBLE, NO DISCUSSION. START WITH {{ AND END WITH }}
+
 GENERAL RULES
 
-* Return valid JSON only.
+* Return ONLY valid JSON. Do not write any text before or after the JSON.
+* Start your response immediately with the opening {{ of the JSON object.
+* End your response immediately after the closing }} of the JSON object.
 * When generating SQL, make certain that all fields joined are of the correct data type and that all joins are valid based on the supplied schema.
   
   1. Ensure that the following error does not occur: Operand type clash: date is incompatible with int.
@@ -913,11 +976,28 @@ SUPPLIED SCHEMA (JSON):
 {JsonSerializer.Serialize(schema)}
 ";
 
-            var txt = await Generate(prompt, selectedModel, ct);
+            var txt = await Generate(prompt, selectedModel, ct, contextLengthPercent: contextLengthPercent, timeoutMinutes: timeoutMinutes);
             logger.LogDebug("AI plan response received, deserializing");
 
             var sanitizedTxt = JsonSanitizer.SanitizeControlCharsInStrings(txt);
-            var plan = JsonSerializer.Deserialize<ReportPlan>(sanitizedTxt, new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? throw new Exception("Invalid Ollama report plan.");
+
+            // Extract JSON from response (in case there's explanatory text before/after)
+            var jsonText = ExtractJsonFromResponse(sanitizedTxt);
+
+            ReportPlan plan;
+            try
+            {
+                plan = JsonSerializer.Deserialize<ReportPlan>(jsonText, new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? throw new Exception("Invalid Ollama report plan.");
+            }
+            catch (JsonException jsonEx)
+            {
+                string responsePreview = jsonText.Length > 1000 
+                    ? jsonText.Substring(0, 1000) + "... [truncated]"
+                    : jsonText;
+                logger.LogError(jsonEx, "Failed to parse Ollama report plan JSON. Model: {Model}, Request: {Request}, Full Response: {FullResponse}", 
+                    selectedModel ?? "default", request, responsePreview);
+                throw new Exception($"Ollama returned invalid JSON for the report plan. The model output format was unexpected. Error: {jsonEx.Message}. Response preview: {jsonText.Substring(0, Math.Min(200, jsonText.Length))}", jsonEx);
+            }
             logger.LogInformation("Report plan generated successfully with {SectionCount} sections", plan.Sections.Count);
 
             foreach (var s in plan.Sections)
@@ -1119,7 +1199,9 @@ SUPPLIED SCHEMA (JSON):
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error generating report plan: {ErrorMessage}", ex.Message);
+            logger.LogError(ex, "Error generating report plan. Model: {Model}, Request: {Request}, Exception type: {ExceptionType}, Message: {ErrorMessage}", 
+                selectedModel ?? "default", request.Length > 200 ? request.Substring(0, 200) + "..." : request, 
+                ex.GetType().Name, ex.Message);
             throw;
         }
         finally
@@ -1128,20 +1210,21 @@ SUPPLIED SCHEMA (JSON):
         }
     }
 
-    public async Task<string> Summarize(ReportResult report, string? selectedModel = null, CancellationToken ct = default)
+    public async Task<string> Summarize(ReportResult report, string? selectedModel = null, CancellationToken ct = default, int? contextLengthPercent = null, int? timeoutMinutes = null)
     {
-        logger.LogDebug("Entering Summarize method");
+        logger.LogDebug("Entering Summarize method with contextLengthPercent: {ContextLengthPercent}, timeoutMinutes: {TimeoutMinutes}", contextLengthPercent ?? 75, timeoutMinutes ?? 3);
         try
         {
             logger.LogInformation("Generating summary for report with {SectionCount} sections", report.Sections.Count);
             var data = JsonSerializer.Serialize(report.Sections.Select(x => new { x.Heading, Rows = x.Rows.Take(30) }));
-            var summary = await Generate("Return JSON with one property named summary. Write a concise factual executive summary using only these results: " + data, selectedModel, ct, true);
+            var summary = await Generate("Return JSON with one property named summary. Write a concise factual executive summary using only these results: " + data, selectedModel, ct, true, contextLengthPercent, timeoutMinutes);
             logger.LogInformation("Report summary generated successfully");
             return summary;
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error generating report summary: {ErrorMessage}", ex.Message);
+            logger.LogError(ex, "Error generating report summary. Model: {Model}, Section count: {SectionCount}, Exception type: {ExceptionType}, Message: {ErrorMessage}", 
+                selectedModel ?? "default", report.Sections.Count, ex.GetType().Name, ex.Message);
             throw;
         }
         finally
@@ -1150,24 +1233,28 @@ SUPPLIED SCHEMA (JSON):
         }
     }
 
-    async Task<string> Generate(string prompt, string? selectedModel = null, CancellationToken ct = default, bool summary = false)
+    async Task<string> Generate(string prompt, string? selectedModel = null, CancellationToken ct = default, bool summary = false, int? contextLengthPercent = null, int? timeoutMinutes = null)
     {
-        logger.LogDebug("Entering Generate method, summary={IsSummary}", summary);
+        logger.LogDebug("Entering Generate method, summary={IsSummary}, timeoutMinutes={TimeoutMinutes}", summary, timeoutMinutes ?? 3);
         try
         {
             var client = f.CreateClient();
-            // Set extended timeout for Ollama requests (5 minutes)
-            client.Timeout = TimeSpan.FromSeconds(300);
+            // Set timeout for Ollama requests based on user configuration (default 3 minutes)
+            int timeoutSec = Math.Max(60, (timeoutMinutes ?? 3) * 60);
+            client.Timeout = TimeSpan.FromSeconds(timeoutSec);
+            logger.LogDebug("Ollama request timeout set to {TimeoutSeconds} seconds", timeoutSec);
 
             var url = (cfg["Ollama:BaseUrl"] ?? "http://localhost:11434").TrimEnd('/'); 
             var model = selectedModel ?? cfg["Ollama:Model"] ?? "qwen3-coder:30b";
             logger.LogDebug("Calling Ollama API at {Url} with model {Model}", url, model);
 
             var maxContext = await GetModelMaxContextLength(model, url, ct);
-            // Use three-quarters of the model's maximum context length rather than the full
-            // amount, to leave headroom for the model's own internal overhead while still
-            // allowing a large schema/prompt.
-            var configuredContext = Math.Max(1, (int)(maxContext * 0.75));
+            // Use the caller-supplied percentage of the model's maximum context length (e.g. from
+            // a user-controlled slider), defaulting to 75% when no percentage is supplied, to
+            // leave headroom for the model's own internal overhead while still allowing a large
+            // schema/prompt.
+            var pct = Math.Clamp(contextLengthPercent ?? 75, 5, 100);
+            var configuredContext = Math.Max(1, (int)(maxContext * (pct / 100.0)));
             lastModelMaxContextLength = maxContext;
             lastConfiguredContextLength = configuredContext;
 
@@ -1179,10 +1266,12 @@ SUPPLIED SCHEMA (JSON):
                 options = new
                 {
                     num_ctx = configuredContext,
-                    temperature = 0
+                    temperature = 0,
+                    use_mmap = true,  // Enable memory-mapped I/O for faster loading
+                    use_mlock = true  // Lock model in memory for consistent performance
                 }
             }, ct);
-            logger.LogDebug("Ollama API response status: {StatusCode}", res.StatusCode);
+            logger.LogDebug("Ollama API response status: {StatusCode}. Memory optimization (mmap/mlock) enabled.", res.StatusCode);
 
             if (!res.IsSuccessStatusCode)
             {
@@ -1194,12 +1283,19 @@ SUPPLIED SCHEMA (JSON):
                     System.Net.HttpStatusCode.BadRequest => $"Invalid request to Ollama API. The model '{model}' or request format may not be supported. Error: {errorContent}",
                     _ => $"Ollama API returned error {(int)res.StatusCode} ({res.StatusCode}). Please check your Ollama configuration and ensure the service is running."
                 };
-                logger.LogError("Ollama API error {StatusCode}: {ErrorMessage}", res.StatusCode, errorMessage);
+                logger.LogError("Ollama API error {StatusCode}: {ErrorMessage}. Request model: {Model}, URL: {Url}, Response body: {ResponseBody}", 
+                    res.StatusCode, errorMessage, model, url, errorContent);
                 throw new Exception(errorMessage);
             }
 
             var body = await res.Content.ReadFromJsonAsync<OllamaResponse>(cancellationToken: ct);
-            var text = body?.response ?? throw new Exception("Unable to select the AI language model. No response received from Ollama API. Please verify that Ollama is running and the model is properly configured.");
+            if (body == null || string.IsNullOrWhiteSpace(body.response))
+            {
+                logger.LogError("Ollama returned empty or null response. Model: {Model}, Body: {@Body}, StatusCode: {StatusCode}", 
+                    model, body, res.StatusCode);
+                throw new Exception("Unable to select the AI language model. No response received from Ollama API. Please verify that Ollama is running and the model is properly configured.");
+            }
+            var text = body.response;
 
             // Track tokens generated
             if (body != null)
@@ -1214,19 +1310,39 @@ SUPPLIED SCHEMA (JSON):
             if (summary) 
             { 
                 var sanitizedSummaryJson = JsonSanitizer.SanitizeControlCharsInStrings(text);
-                using var doc = JsonDocument.Parse(sanitizedSummaryJson); 
-                return doc.RootElement.GetProperty("summary").GetString() ?? ""; 
+                try
+                {
+                    using var doc = JsonDocument.Parse(sanitizedSummaryJson); 
+                    return doc.RootElement.GetProperty("summary").GetString() ?? ""; 
+                }
+                catch (JsonException jsonEx)
+                {
+                    string responsePreview = sanitizedSummaryJson.Length > 500 
+                        ? sanitizedSummaryJson.Substring(0, 500) + "... [truncated]"
+                        : sanitizedSummaryJson;
+                    logger.LogError(jsonEx, "Failed to parse LLM JSON summary response. Model: {Model}, Full Response: {FullResponse}", 
+                        model, responsePreview);
+                    throw new Exception($"Ollama returned invalid JSON response. The model output format was unexpected. Error: {jsonEx.Message}. Response preview: {sanitizedSummaryJson.Substring(0, Math.Min(100, sanitizedSummaryJson.Length))}", jsonEx);
+                }
             }
             return text;
         }
         catch (HttpRequestException ex)
         {
-            logger.LogError(ex, "Failed to connect to Ollama API: {ErrorMessage}", ex.Message);
+            logger.LogError(ex, "Failed to connect to Ollama API. Model: {Model}, URL: {Url}, Timeout: {TimeoutSeconds}s, ErrorMessage: {ErrorMessage}", 
+                selectedModel ?? "default", cfg["Ollama:BaseUrl"] ?? "http://localhost:11434", (timeoutMinutes ?? 3) * 60, ex.Message);
             throw new Exception($"Unable to connect to Ollama. Please verify that Ollama is running. Details: {ex.Message}", ex);
         }
-        catch (Exception ex) when (!(ex is HttpRequestException))
+        catch (JsonException ex)
         {
-            logger.LogError(ex, "Error generating text from Ollama: {ErrorMessage}", ex.Message);
+            logger.LogError(ex, "JSON parsing error from Ollama response. Model: {Model}, IsSummary: {IsSummary}, ErrorMessage: {ErrorMessage}", 
+                selectedModel ?? "default", summary, ex.Message);
+            throw new Exception($"Ollama response parsing failed. This typically means the model is not returning valid JSON. Error: {ex.Message}. Please try again or select a different model.", ex);
+        }
+        catch (Exception ex) when (!(ex is HttpRequestException || ex is JsonException))
+        {
+            logger.LogError(ex, "Error generating text from Ollama. Model: {Model}, IsSummary: {IsSummary}, Timeout: {TimeoutSeconds}s, Exception type: {ExceptionType}, Message: {ErrorMessage}", 
+                selectedModel ?? "default", summary, (timeoutMinutes ?? 3) * 60, ex.GetType().Name, ex.Message);
             throw;
         }
         finally

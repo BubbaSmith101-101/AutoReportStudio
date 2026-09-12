@@ -79,6 +79,39 @@
                 <option value="">Loading models...</option>
             </select>
             <p class="hint" id="modelHint">Connecting to Ollama to fetch available models.</p>
+
+            <div id="contextLengthSliderContainer" style="display: none; margin-top: 20px;">
+                <label for="contextLengthSlider">Context Length</label>
+                <div style="display: flex; align-items: center; gap: 10px; margin: 10px 0;">
+                    <span style="white-space: nowrap;">2%</span>
+                    <input type="range" id="contextLengthSlider" min="2" max="100" value="2" step="2" style="flex-grow: 1;"
+                        disabled>
+                    <span style="white-space: nowrap;">100%</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; margin-top: 5px;">
+                    <span style="font-size: 12px; color: #666;">Min: <span id="sliderMinValue">-</span></span>
+                    <div style="text-align: center;">
+                        <span style="font-size: 14px; font-weight: bold; color: #1a73e8;" id="sliderPercentage">2%</span>
+                        <span style="font-size: 12px; color: #666;">of Max</span>
+                    </div>
+                    <span style="font-size: 12px; color: #666;">Max: <span id="sliderMaxValue">-</span></span>
+                </div>
+                <div style="text-align: center; margin-top: 5px;">
+                    <span style="font-size: 14px; color: #333; font-weight: 500;" id="sliderConfiguredValue">-</span>
+                </div>
+            </div>
+
+            <div id="timeoutSliderContainer" style="display: none; margin-top: 20px;">
+                <label for="timeoutSlider">Ollama Request Timeout</label>
+                <div style="display: flex; align-items: center; gap: 10px; margin: 10px 0;">
+                    <span style="white-space: nowrap;">1 min</span>
+                    <input type="range" id="timeoutSlider" min="1" max="30" value="3" step="1" style="flex-grow: 1;">
+                    <span style="white-space: nowrap;">30 min</span>
+                </div>
+                <div style="text-align: center; margin-top: 5px;">
+                    <span style="font-size: 14px; color: #333; font-weight: 500;" id="timeoutValue">3 minutes</span>
+                </div>
+            </div>
             </fieldset>
         </div>
 
@@ -96,12 +129,158 @@
 }
 
 <script>
+    // Session storage utilities for form state persistence
+    const SESSION_KEYS = {
+        MODEL: 'reportForm_selectedModel',
+        REQUEST: 'reportForm_request',
+        TABLES: 'reportForm_selectedTables',
+        CONTEXT_LENGTH: 'reportForm_contextLength',
+        TIMEOUT: 'reportForm_timeout',
+        CONNECTION_STRING: 'reportForm_connectionString'
+    };
+
+    function saveFormStateToSession() {
+        // Save model selection
+        const modelSelect = document.getElementById('modelSelect');
+        if (modelSelect && modelSelect.value) {
+            sessionStorage.setItem(SESSION_KEYS.MODEL, modelSelect.value);
+        }
+
+        // Save request text
+        const requestInput = document.querySelector('[name="Request"]');
+        if (requestInput && requestInput.value) {
+            sessionStorage.setItem(SESSION_KEYS.REQUEST, requestInput.value);
+        }
+
+        // Save selected tables
+        const selectedTables = Array.from(document.querySelectorAll('[name="SelectedTables"]:checked'))
+            .map(el => el.value);
+        if (selectedTables.length > 0) {
+            sessionStorage.setItem(SESSION_KEYS.TABLES, JSON.stringify(selectedTables));
+        }
+
+        // Save context length slider value
+        const contextSlider = document.getElementById('contextLengthSlider');
+        if (contextSlider && contextSlider.value) {
+            sessionStorage.setItem(SESSION_KEYS.CONTEXT_LENGTH, contextSlider.value);
+        }
+
+        // Save timeout slider value
+        const timeoutSlider = document.getElementById('timeoutSlider');
+        if (timeoutSlider && timeoutSlider.value) {
+            sessionStorage.setItem(SESSION_KEYS.TIMEOUT, timeoutSlider.value);
+        }
+
+        // Save connection string
+        const connInput = document.querySelector('[name="ConnectionString"]');
+        if (connInput && connInput.value) {
+            sessionStorage.setItem(SESSION_KEYS.CONNECTION_STRING, connInput.value);
+        }
+    }
+
+    function restoreFormStateFromSession() {
+        console.log('Attempting to restore form state from session storage');
+
+        // Restore model selection
+        const savedModel = sessionStorage.getItem(SESSION_KEYS.MODEL);
+        console.log('Saved model from session:', savedModel);
+        const modelSelect = document.getElementById('modelSelect');
+        if (savedModel && modelSelect) {
+            // Try to set model directly (should work since we waited for loadModels to complete)
+            const option = modelSelect.querySelector(`option[value="${savedModel}"]`);
+            if (option) {
+                console.log('Found model option, setting value to:', savedModel);
+                modelSelect.value = savedModel;
+                modelSelect.dispatchEvent(new Event('change', { bubbles: true }));
+            } else {
+                // If model not found, log for debugging
+                console.warn('Saved model not found in dropdown:', savedModel);
+                console.log('Available options:', Array.from(modelSelect.options).map(o => o.value));
+            }
+        }
+
+        // Restore request text
+        const savedRequest = sessionStorage.getItem(SESSION_KEYS.REQUEST);
+        const requestInput = document.querySelector('[name="Request"]');
+        if (savedRequest && requestInput) {
+            requestInput.value = savedRequest;
+            // Trigger validation to update form state
+            requestInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+
+        // Restore selected tables
+        const savedTables = sessionStorage.getItem(SESSION_KEYS.TABLES);
+        if (savedTables) {
+            try {
+                const tableValues = JSON.parse(savedTables);
+                if (Array.isArray(tableValues)) {
+                    tableValues.forEach(tableValue => {
+                        const checkbox = document.querySelector(`[name="SelectedTables"][value="${tableValue}"]`);
+                        if (checkbox) {
+                            checkbox.checked = true;
+                        }
+                    });
+                    // Re-run validation after restoring tables so the validation message clears
+                    if (typeof validateForm === 'function') {
+                        validateForm();
+                    }
+                }
+            } catch (e) {
+                console.error('Error restoring table selections:', e);
+            }
+        }
+
+        // Restore context length slider
+        const savedContextLength = sessionStorage.getItem(SESSION_KEYS.CONTEXT_LENGTH);
+        const contextSlider = document.getElementById('contextLengthSlider');
+        if (savedContextLength && contextSlider) {
+            const contextValue = parseInt(savedContextLength);
+            if (!isNaN(contextValue) && contextValue >= 2 && contextValue <= 100) {
+                contextSlider.value = contextValue;
+                currentSliderValue = contextValue;
+                updateSliderDisplay();
+            }
+        }
+
+        // Restore timeout slider
+        const savedTimeout = sessionStorage.getItem(SESSION_KEYS.TIMEOUT);
+        const timeoutSlider = document.getElementById('timeoutSlider');
+        if (savedTimeout && timeoutSlider) {
+            const timeoutValue = parseInt(savedTimeout);
+            if (!isNaN(timeoutValue) && timeoutValue >= 1 && timeoutValue <= 30) {
+                timeoutSlider.value = timeoutValue;
+                const timeoutDisplay = document.getElementById('timeoutValue');
+                if (timeoutDisplay) {
+                    timeoutDisplay.textContent = timeoutValue + ' minute' + (timeoutValue !== 1 ? 's' : '');
+                }
+            }
+        }
+
+        // Restore connection string
+        const savedConnString = sessionStorage.getItem(SESSION_KEYS.CONNECTION_STRING);
+        const connInput = document.querySelector('[name="ConnectionString"]');
+        if (savedConnString && connInput) {
+            connInput.value = savedConnString;
+            console.log('Restored connection string from session');
+        }
+
+        console.log('Form state restoration completed');
+    }
+
+    function clearFormStateFromSession() {
+        Object.values(SESSION_KEYS).forEach(key => {
+            sessionStorage.removeItem(key);
+        });
+    }
+
     function formatBytes(bytes) {
         if (!bytes || bytes <= 0) return null;
         const gb = bytes / (1024 * 1024 * 1024);
-        if (gb >= 1) return gb.toFixed(1) + ' GB';
+        if (gb >= 1) return gb.toFixed(2) + ' GB';
         const mb = bytes / (1024 * 1024);
-        return mb.toFixed(0) + ' MB';
+        if (mb >= 1) return mb.toFixed(2) + ' MB';
+        const kb = bytes / 1024;
+        return kb.toFixed(0) + ' KB';
     }
 
     function formatModelLabel(model) {
@@ -167,10 +346,26 @@
                     select.appendChild(option);
                 });
                 if (hint) hint.textContent = 'Select an AI model to use for report generation.';
+
+                // Initialize context length slider container
+                const sliderContainer = document.getElementById('contextLengthSliderContainer');
+                if (sliderContainer) {
+                    sliderContainer.style.display = 'block';
+                }
+
+                // Initialize slider values after model is selected
+                modelSelect.addEventListener('change', updateSliderForSelectedModel);
             } else {
                 select.innerHTML = '<option value="">No models available</option>';
                 if (hint) hint.textContent = 'No AI models found. Please ensure Ollama is running and models are installed.';
+
+                // Hide slider container if no models
+                const sliderContainer = document.getElementById('contextLengthSliderContainer');
+                if (sliderContainer) {
+                    sliderContainer.style.display = 'none';
+                }
             }
+
             validateForm();
         } catch (error) {
             console.error('Error loading models:', error);
@@ -178,16 +373,51 @@
             if (hint) hint.textContent = `Failed to load models: ${error.message}`;
             const select = document.getElementById('modelSelect');
             if (select) select.innerHTML = '<option value="">Failed to load models</option>';
+
+            // Hide slider container on error
+            const sliderContainer = document.getElementById('contextLengthSliderContainer');
+            if (sliderContainer) {
+                sliderContainer.style.display = 'none';
+            }
         }
     }
 
-    // Call loadModels after DOM is fully loaded
-    document.addEventListener('DOMContentLoaded', loadModels);
+    // Call loadModels after DOM is fully loaded, then restore form state
+    document.addEventListener('DOMContentLoaded', async function() {
+        await loadModels();
+        // Give the DOM a moment to render the loaded models
+        await new Promise(resolve => setTimeout(resolve, 100));
+        restoreFormStateFromSession();
+    });
+
+    // Initialize timeout slider
+    (function() {
+        const timeoutSlider = document.getElementById('timeoutSlider');
+        const timeoutValue = document.getElementById('timeoutValue');
+        const timeoutContainer = document.getElementById('timeoutSliderContainer');
+
+        if (timeoutSlider && timeoutValue && timeoutContainer) {
+            // Show timeout slider
+            timeoutContainer.style.display = 'block';
+
+            // Update display when slider changes
+            function updateTimeoutDisplay() {
+                const minutes = parseInt(timeoutSlider.value);
+                timeoutValue.textContent = minutes + ' minute' + (minutes !== 1 ? 's' : '');
+            }
+
+            timeoutSlider.addEventListener('input', updateTimeoutDisplay);
+            updateTimeoutDisplay();
+        }
+    })();
 
     // Disable Discover form's fieldset while it submits
     const discoverForm = document.getElementById('discoverForm');
     if (discoverForm) {
         discoverForm.addEventListener('submit', function() {
+            // Save connection string to session
+            saveFormStateToSession();
+
             // Defer disabling until after the browser has captured form data,
             // otherwise disabled fields are excluded from the submission.
             setTimeout(() => {
@@ -219,14 +449,26 @@
 
     if (selectAllTablesBtn) {
         selectAllTablesBtn.addEventListener('click', function () {
-            checkboxes.forEach(checkbox => { checkbox.checked = true; });
+            // Select all checkboxes (both visible and hidden)
+            const allCheckboxes = document.querySelectorAll('[name="SelectedTables"]');
+            allCheckboxes.forEach(checkbox => { 
+                checkbox.checked = true;
+                // Trigger change event to ensure validation runs
+                checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+            });
             validateForm();
         });
     }
 
     if (clearAllTablesBtn) {
         clearAllTablesBtn.addEventListener('click', function () {
-            checkboxes.forEach(checkbox => { checkbox.checked = false; });
+            // Clear all checkboxes (both visible and hidden)
+            const allCheckboxes = document.querySelectorAll('[name="SelectedTables"]');
+            allCheckboxes.forEach(checkbox => { 
+                checkbox.checked = false;
+                // Trigger change event to ensure validation runs
+                checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+            });
             validateForm();
         });
     }
@@ -234,14 +476,19 @@
     function validateForm() {
         const modelSelect = document.getElementById('modelSelect');
         const requestTextarea = document.querySelector('[name="Request"]');
-        const tableCheckboxes = document.querySelectorAll('[name="SelectedTables"]:checked');
         const generateButton = document.getElementById('generateButton');
         const validationMessage = document.getElementById('validationMessage');
+
+        // Check tables by directly querying .checked property instead of :checked pseudo-selector
+        const allCheckboxes = document.querySelectorAll('[name="SelectedTables"]');
+        const checkedCheckboxes = Array.from(allCheckboxes).filter(cb => cb.checked);
 
         console.log('validateForm called:', {
             modelSelect: modelSelect ? modelSelect.value : 'not found',
             requestValue: requestTextarea ? requestTextarea.value : 'not found',
-            checkboxesChecked: tableCheckboxes.length
+            allCheckboxesCount: allCheckboxes.length,
+            checkedCount: checkedCheckboxes.length,
+            checkedValues: checkedCheckboxes.map(cb => cb.value)
         });
 
         if (!modelSelect || !requestTextarea || !generateButton) {
@@ -251,7 +498,7 @@
 
         const modelSelected = modelSelect.value !== '';
         const requestFilled = requestTextarea.value.trim() !== '';
-        const tablesSelected = tableCheckboxes && tableCheckboxes.length > 0;
+        const tablesSelected = checkedCheckboxes.length > 0;
         const isFormValid = modelSelected && requestFilled && tablesSelected;
 
         console.log('Validation results:', { modelSelected, requestFilled, tablesSelected, isFormValid });
@@ -282,8 +529,13 @@
     if (generateForm) {
         generateForm.addEventListener('submit', function(e) {
             const modelSelect = document.getElementById('modelSelect');
+            const sliderValue = getSliderValue();
+
             if (modelSelect && modelSelect.value) {
-                // Add model and connection string as hidden inputs before submit
+                // Save form state to session before submitting
+                saveFormStateToSession();
+
+                // Add model, connection string, and context length as hidden inputs before submit
                 const modelInput = document.createElement('input');
                 modelInput.type = 'hidden';
                 modelInput.name = 'SelectedModel';
@@ -296,6 +548,29 @@
                 connInput.value = document.querySelector('[name="ConnectionString"]').value;
                 generateForm.appendChild(connInput);
 
+                if (sliderValue) {
+                    const contextPercent = parseInt(sliderValue);
+                    if (!isNaN(contextPercent) && contextPercent >= 2 && contextPercent <= 100) {
+                        const sliderInput = document.createElement('input');
+                        sliderInput.type = 'hidden';
+                        sliderInput.name = 'ContextLengthPercent';
+                        sliderInput.value = contextPercent;
+                        generateForm.appendChild(sliderInput);
+                    }
+                }
+
+                const timeoutSlider = document.getElementById('timeoutSlider');
+                if (timeoutSlider && timeoutSlider.value) {
+                    const timeoutMinutes = parseInt(timeoutSlider.value);
+                    if (!isNaN(timeoutMinutes) && timeoutMinutes >= 1 && timeoutMinutes <= 30) {
+                        const timeoutInput = document.createElement('input');
+                        timeoutInput.type = 'hidden';
+                        timeoutInput.name = 'TimeoutMinutes';
+                        timeoutInput.value = timeoutMinutes;
+                        generateForm.appendChild(timeoutInput);
+                    }
+                }
+
                 showLoadingSpinner();
 
                 // Defer disabling inputs until after the browser has captured
@@ -304,6 +579,84 @@
                 setTimeout(disableFormInputs, 0);
             }
         });
+    }
+
+    // Slider state
+    let currentModelMaxContext = 0;
+    let currentSliderValue = 2;
+
+    async function updateSliderForSelectedModel() {
+        const modelSelect = document.getElementById('modelSelect');
+        const sliderContainer = document.getElementById('contextLengthSliderContainer');
+        const slider = document.getElementById('contextLengthSlider');
+        const sliderMin = document.getElementById('sliderMinValue');
+        const sliderMax = document.getElementById('sliderMaxValue');
+        const sliderPercentage = document.getElementById('sliderPercentage');
+        const sliderConfigured = document.getElementById('sliderConfiguredValue');
+
+        if (!sliderContainer || !slider || !modelSelect) return;
+
+        const selectedModel = modelSelect.value;
+        if (!selectedModel) {
+            sliderContainer.style.display = 'none';
+            return;
+        }
+
+        try {
+            // Fetch max context length for selected model
+            const response = await fetch(`/Report/GetModelMaxContext?model=${encodeURIComponent(selectedModel)}`);
+            if (response.ok) {
+                const maxContext = await response.json();
+                currentModelMaxContext = maxContext;
+
+                // Enable slider and show container
+                slider.disabled = false;
+                sliderContainer.style.display = 'block';
+
+                // Update min/max display values
+                if (sliderMin) sliderMin.textContent = formatBytes(Math.max(1, Math.floor(maxContext * 0.02)));
+                if (sliderMax) sliderMax.textContent = formatBytes(maxContext);
+
+                // Calculate default: max of 4k or 2%
+                const defaultPercent = Math.max(2, (4096 / maxContext) * 100);
+                currentSliderValue = Math.round(defaultPercent / 2) * 2; // Round to nearest 2%
+                if (currentSliderValue < 2) currentSliderValue = 2;
+                if (currentSliderValue > 100) currentSliderValue = 100;
+
+                slider.value = currentSliderValue;
+                updateSliderDisplay();
+
+                // Add input handler
+                slider.oninput = function() {
+                    currentSliderValue = parseInt(this.value);
+                    updateSliderDisplay();
+                };
+            } else {
+                console.error('Failed to fetch model max context');
+                slider.disabled = true;
+                sliderContainer.style.display = 'none';
+            }
+        } catch (error) {
+            console.error('Error fetching model max context:', error);
+            slider.disabled = true;
+            sliderContainer.style.display = 'none';
+        }
+    }
+
+    function updateSliderDisplay() {
+        const sliderPercentage = document.getElementById('sliderPercentage');
+        const sliderConfigured = document.getElementById('sliderConfiguredValue');
+
+        if (!sliderPercentage || !sliderConfigured || currentModelMaxContext <= 0) return;
+
+        // Update percentage display
+        if (sliderPercentage) sliderPercentage.textContent = currentSliderValue + '%';
+
+        // Calculate configured context length
+        const configured = Math.max(1, Math.floor(currentModelMaxContext * (currentSliderValue / 100.0)));
+
+        // Format bytes for display
+        if (sliderConfigured) sliderConfigured.textContent = formatBytes(configured);
     }
 
     function disableFormInputs() {
@@ -326,6 +679,12 @@
         }
     }
 
+    // Get slider value
+    function getSliderValue() {
+        const slider = document.getElementById('contextLengthSlider');
+        return slider ? slider.value : null;
+    }
+
     function showLoadingSpinner() {
         const overlay = document.getElementById('loadingOverlay');
         const processingStatus = document.getElementById('processingStatus');
@@ -345,7 +704,7 @@
         const lastBtn = document.getElementById('lastPageBtn');
         const pageSizeSelect = document.getElementById('pageSizeSelect');
         const tableListContainer = document.getElementById('table-list-container');
-        const tableCount = @Model.Schema?.Tables.Count ?? 0;
+        const tableCount = @(Model.Schema?.Tables.Count ?? 0);
         let pageSize = @Model.PageSize;
         let totalPages = @Model.TotalPages;
         let currentPage = @Model.CurrentPage;
@@ -365,6 +724,7 @@
             const endIndex = Math.min(startIndex + pageSize, tableCount);
 
             // Hide all table items first
+            if (!tableListContainer) return;
             const allLabels = tableListContainer.querySelectorAll('.choice');
             allLabels.forEach(label => {
                 label.style.display = 'none';

@@ -5,7 +5,7 @@ namespace AutoReportStudio.Web.Services;
 
 public interface IReportService 
 { 
-    Task<ReportResult> Generate(string cs, List<string> selected, string request, string? selectedModel = null, CancellationToken ct = default); 
+    Task<ReportResult> Generate(string cs, List<string> selected, string request, string? selectedModel = null, CancellationToken ct = default, int? contextLengthPercent = null, int? timeoutMinutes = null); 
 }
 
 public class ReportService : IReportService
@@ -24,9 +24,9 @@ public class ReportService : IReportService
         logger = l;
     }
 
-    public async Task<ReportResult> Generate(string cs, List<string> selected, string request, string? selectedModel = null, CancellationToken ct = default)
+    public async Task<ReportResult> Generate(string cs, List<string> selected, string request, string? selectedModel = null, CancellationToken ct = default, int? contextLengthPercent = null, int? timeoutMinutes = null)
     {
-        logger.LogDebug("Entering Generate method with {TableCount} selected tables", selected.Count);
+        logger.LogDebug("Entering Generate method with {TableCount} selected tables, contextLengthPercent: {ContextLengthPercent}, timeoutMinutes: {TimeoutMinutes}", selected.Count, contextLengthPercent ?? 75, timeoutMinutes ?? 3);
         var startTime = DateTime.UtcNow;
         long timeToFirstTokenMs = 0;
         using var firstTokenCts = new CancellationTokenSource();
@@ -60,11 +60,11 @@ public class ReportService : IReportService
                 throw new Exception("Select at least one table.");
             }
 
-            logger.LogDebug("Requesting AI plan for report with selectedModel: {SelectedModel}", selectedModel);
-            var plan = await ollama.Plan(db, request, selectedModel, ct, cs); 
+            logger.LogDebug("Requesting AI plan for report with selectedModel: {SelectedModel}, contextLengthPercent: {ContextLengthPercent}, timeoutMinutes: {TimeoutMinutes}", selectedModel, contextLengthPercent ?? 75, timeoutMinutes ?? 3);
+            var plan = await ollama.Plan(db, request, selectedModel, ct, cs, contextLengthPercent, timeoutMinutes); 
             logger.LogInformation("AI plan generated with {SectionCount} sections", plan.Sections.Count);
 
-            var result = new ReportResult { Title = plan.Title, ModelUsed = selectedModel ?? "", UserRequest = request };
+            var result = new ReportResult { Title = plan.Title, ModelUsed = selectedModel ?? "", UserRequest = request, ConfiguredTimeoutSeconds = (timeoutMinutes ?? 3) * 60 };
             await using var cn = new SqlConnection(cs); 
             await cn.OpenAsync(ct);
             logger.LogDebug("Database connection opened");
@@ -109,8 +109,8 @@ public class ReportService : IReportService
                 processedSections++;
             }
 
-            logger.LogDebug("Processed {ProcessedSectionCount} sections, requesting summary with selectedModel: {SelectedModel}", processedSections, selectedModel);
-            result.Summary = await ollama.Summarize(result, selectedModel, ct);
+            logger.LogDebug("Processed {ProcessedSectionCount} sections, requesting summary with selectedModel: {SelectedModel}, contextLengthPercent: {ContextLengthPercent}, timeoutMinutes: {TimeoutMinutes}", processedSections, selectedModel, contextLengthPercent ?? 75, timeoutMinutes ?? 3);
+            result.Summary = await ollama.Summarize(result, selectedModel, ct, contextLengthPercent, timeoutMinutes);
 
             // Capture processing time and token count
             var elapsed = DateTime.UtcNow - startTime;

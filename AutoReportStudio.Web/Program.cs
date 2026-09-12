@@ -45,6 +45,7 @@ try
     Console.WriteLine("HttpClient service configured");
 
     builder.Services.AddScoped<ISchemaService, SchemaService>();
+    builder.Services.AddHttpClient<ILLMCorrectionService, LLMCorrectionService>();
     builder.Services.AddScoped<IOllamaService, OllamaService>();
     builder.Services.AddScoped<IReportService, ReportService>();
     builder.Services.AddScoped<IExcelService, ExcelService>();

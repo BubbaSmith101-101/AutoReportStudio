@@ -12,13 +12,15 @@ public class ReportService : IReportService
 {
     readonly ISchemaService schema; 
     readonly IOllamaService ollama;
+    readonly ILLMCorrectionService correctionService;
     readonly ILogger<ReportService> logger;
     static readonly Regex Bad = new(@"\b(INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|CREATE|TRUNCATE|EXEC|EXECUTE|GRANT|REVOKE|DENY|DBCC|BACKUP|RESTORE|OPENROWSET|OPENDATASOURCE|KILL)\b", RegexOptions.IgnoreCase);
 
-    public ReportService(ISchemaService s, IOllamaService o, ILogger<ReportService> l) 
+    public ReportService(ISchemaService s, IOllamaService o, ILLMCorrectionService c, ILogger<ReportService> l) 
     { 
         schema = s; 
         ollama = o;
+        correctionService = c;
         logger = l;
     }
 
@@ -96,22 +98,7 @@ public class ReportService : IReportService
                 try
                 {
                     logger.LogDebug("Executing query for section {SectionHeading}", p.Heading);
-                    await using var cmd = new SqlCommand(p.Sql, cn) { CommandTimeout = 60 }; 
-                    await using var r = await cmd.ExecuteReaderAsync(ct);
-
-                    for (int i = 0; i < r.FieldCount; i++) 
-                        sec.Columns.Add(r.GetName(i)); 
-
-                    int count = 0;
-                    while (await r.ReadAsync(ct) && count++ < 500) 
-                    { 
-                        var row = new List<string?>(); 
-                        for (int i = 0; i < r.FieldCount; i++) 
-                            row.Add(r.IsDBNull(i) ? null : Convert.ToString(r.GetValue(i))); 
-
-                        sec.Rows.Add(row); 
-                    }
-                    logger.LogInformation("Query executed successfully for section {SectionHeading} with {RowCount} rows", p.Heading, count);
+                    await ExecuteSectionQuery(sec, p, db, cn, request, selectedModel, ct);
                 }
                 catch (Exception ex) 
                 { 
@@ -146,5 +133,72 @@ public class ReportService : IReportService
             firstTokenCts.Cancel();
             logger.LogDebug("Exiting Generate method");
         }
+    }
+
+    /// <summary>
+    /// Executes a section's SQL query. If execution fails, asks the LLM to correct the SQL
+    /// (bounded by LLMCorrectionService's internal max-attempt safeguard) and retries once
+    /// with the corrected query.
+    /// </summary>
+    private async Task ExecuteSectionQuery(
+        ReportSection sec,
+        SectionPlan p,
+        DbSchema db,
+        SqlConnection cn,
+        string request,
+        string? selectedModel,
+        CancellationToken ct)
+    {
+        try
+        {
+            await RunQuery(sec, p.Sql, cn, ct);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Query failed for section {SectionHeading}, attempting LLM self-correction: {ErrorMessage}", p.Heading, ex.Message);
+
+            var corrected = await correctionService.CorrectSqlExecutionError(
+                p, db, ex.Message, request, selectedModel, ct);
+
+            if (corrected == null || string.IsNullOrWhiteSpace(corrected.Sql))
+            {
+                throw;
+            }
+
+            var q = Regex.Replace(corrected.Sql, @"(--.*?$)|(/\*.*?\*/)", " ", RegexOptions.Multiline | RegexOptions.Singleline).Trim();
+            if (!(q.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase) || q.StartsWith("WITH", StringComparison.OrdinalIgnoreCase)) || Bad.IsMatch(q))
+            {
+                logger.LogWarning("Corrected query for section {SectionHeading} rejected by read-only validator", p.Heading);
+                throw;
+            }
+
+            sec.Sql = corrected.Sql;
+            p.Sql = corrected.Sql;
+            logger.LogInformation("Retrying execution for section {SectionHeading} with LLM-corrected SQL", p.Heading);
+            await RunQuery(sec, corrected.Sql, cn, ct);
+        }
+    }
+
+    private async Task RunQuery(ReportSection sec, string sql, SqlConnection cn, CancellationToken ct)
+    {
+        sec.Columns.Clear();
+        sec.Rows.Clear();
+
+        await using var cmd = new SqlCommand(sql, cn) { CommandTimeout = 60 };
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+
+        for (int i = 0; i < r.FieldCount; i++)
+            sec.Columns.Add(r.GetName(i));
+
+        int count = 0;
+        while (await r.ReadAsync(ct) && count++ < 500)
+        {
+            var row = new List<string?>();
+            for (int i = 0; i < r.FieldCount; i++)
+                row.Add(r.IsDBNull(i) ? null : Convert.ToString(r.GetValue(i)));
+
+            sec.Rows.Add(row);
+        }
+        logger.LogInformation("Query executed successfully with {RowCount} rows", count);
     }
 }

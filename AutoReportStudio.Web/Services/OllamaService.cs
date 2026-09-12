@@ -198,13 +198,15 @@ public class OllamaService : IOllamaService
     readonly IHttpClientFactory f; 
     readonly IConfiguration cfg;
     readonly ILogger<OllamaService> logger;
+    readonly ILLMCorrectionService correctionService;
     private long totalTokensGenerated = 0;
 
-    public OllamaService(IHttpClientFactory f, IConfiguration cfg, ILogger<OllamaService> l) 
+    public OllamaService(IHttpClientFactory f, IConfiguration cfg, ILogger<OllamaService> l, ILLMCorrectionService correctionService) 
     { 
         this.f = f; 
         this.cfg = cfg;
         logger = l;
+        this.correctionService = correctionService;
     }
 
     public long GetTotalTokensGenerated()
@@ -605,11 +607,44 @@ SUPPLIED SCHEMA (JSON):
             {
                 SqlValidator.ValidateAndRepairPlan(plan, schema, logger);
 
-                // Check for any remaining invalid columns
+                // Check for any remaining invalid columns and log them
                 var errors = SqlValidator.GetInvalidColumnErrors(plan, schema, logger);
                 if (!string.IsNullOrEmpty(errors))
                 {
                     logger.LogWarning("Generated SQL contains invalid columns:\n{Errors}", errors);
+                }
+
+                // For each section, detect hallucinated columns and ask the LLM to self-correct.
+                // LLMCorrectionService enforces a maximum number of correction attempts internally
+                // so we never call the LLM in an unbounded loop.
+                foreach (var sec in plan.Sections)
+                {
+                    if (string.IsNullOrWhiteSpace(sec.Sql)) continue;
+
+                    var hallucinatedColumns = correctionService.ValidateSQL(sec.Sql, schema);
+                    if (hallucinatedColumns.Count == 0) continue;
+
+                    logger.LogWarning(
+                        "Section '{Heading}' contains {Count} hallucinated column(s): {Columns}. Requesting LLM self-correction.",
+                        sec.Heading, hallucinatedColumns.Count, string.Join(", ", hallucinatedColumns));
+
+                    var corrected = await correctionService.CorrectHallucinations(
+                        sec, schema, hallucinatedColumns, request, selectedModel, ct);
+
+                    if (corrected != null)
+                    {
+                        sec.Sql = corrected.Sql;
+                        logger.LogInformation("Section '{Heading}' SQL successfully self-corrected by LLM.", sec.Heading);
+                    }
+                    else
+                    {
+                        logger.LogError(
+                            "Section '{Heading}' still contains hallucinated columns after correction attempts. Marking query as invalid.",
+                            sec.Heading);
+                        // Invalidate the SQL so the read-only validator in ReportService rejects it
+                        // instead of executing a query against non-existent columns.
+                        sec.Sql = $"-- Unable to generate valid SQL: hallucinated columns could not be corrected ({string.Join(", ", hallucinatedColumns)})";
+                    }
                 }
             }
             catch (Exception ex)

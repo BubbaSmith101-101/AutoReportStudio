@@ -42,7 +42,10 @@ public static class SchemaFormatterService
                 {
                     var pkMarker = col.PrimaryKey ? " [PRIMARY KEY]" : "";
                     var nullableMarker = col.Nullable ? " [NULLABLE]" : " [NOT NULL]";
-                    sb.AppendLine($"  - [{col.Name}] {col.Type}{nullableMarker}{pkMarker}");
+                    var valuesMarker = (col.SampleValues != null && col.SampleValues.Count > 0)
+                        ? $" [Actual values: {string.Join(", ", col.SampleValues.Select(v => $"'{v}'"))}]"
+                        : "";
+                    sb.AppendLine($"  - [{col.Name}] {col.Type}{nullableMarker}{pkMarker}{valuesMarker}");
                 }
             }
 
@@ -107,7 +110,10 @@ public static class SchemaFormatterService
                 sb.AppendLine($"  [{table.Schema}].[{table.Name}]:");
                 foreach (var col in table.Columns.OrderBy(c => c.Name))
                 {
-                    sb.AppendLine($"    - [{col.Name}] ({col.Type})");
+                    var valuesMarker = (col.SampleValues != null && col.SampleValues.Count > 0)
+                        ? $" [Actual values: {string.Join(", ", col.SampleValues.Select(v => $"'{v}'"))}]"
+                        : "";
+                    sb.AppendLine($"    - [{col.Name}] ({col.Type}){valuesMarker}");
                 }
             }
         }
@@ -159,7 +165,10 @@ public static class SchemaFormatterService
                     sb.AppendLine($"  [{table.Schema}].[{table.Name}]:");
                     foreach (var col in table.Columns.OrderBy(c => c.Name))
                     {
-                        sb.AppendLine($"    - [{col.Name}] ({col.Type})");
+                        var valuesMarker = (col.SampleValues != null && col.SampleValues.Count > 0)
+                            ? $" [Actual values: {string.Join(", ", col.SampleValues.Select(v => $"'{v}'"))}]"
+                            : "";
+                        sb.AppendLine($"    - [{col.Name}] ({col.Type}){valuesMarker}");
                     }
                 }
             }
@@ -176,6 +185,75 @@ public static class SchemaFormatterService
         sb.AppendLine("- All bracketed identifiers must have matching [ and ] and correctly paired parentheses.");
         sb.AppendLine("- Only use column names that are confirmed to exist in the schema shown above.");
         sb.AppendLine("IMPORTANT: Return ONLY the corrected SQL query, nothing else.");
+        sb.AppendLine();
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Creates a corrective prompt to send back to the LLM when a query executed successfully
+    /// but returned zero rows, in case overly restrictive filters/joins/date windows are
+    /// excluding data that actually exists.
+    /// </summary>
+    public static string CreateZeroResultCorrectionPrompt(
+        string originalSql,
+        string sectionHeading,
+        string sectionPurpose,
+        string userRequest,
+        DbSchema schema)
+    {
+        if (string.IsNullOrWhiteSpace(originalSql))
+            return "";
+
+        var sb = new System.Text.StringBuilder();
+
+        sb.AppendLine("=== QUERY RETURNED ZERO ROWS - REVIEW NEEDED ===");
+        sb.AppendLine($"Section: {sectionHeading}");
+        if (!string.IsNullOrWhiteSpace(sectionPurpose))
+            sb.AppendLine($"Purpose: {sectionPurpose}");
+        sb.AppendLine($"Overall report request: {userRequest}");
+        sb.AppendLine();
+        sb.AppendLine("The SQL below executed successfully but returned NO ROWS. Data is expected to exist for this task.");
+        sb.AppendLine();
+
+        var usedTableNames = ExtractTableNamesFromSql(originalSql);
+        if (usedTableNames.Count > 0)
+        {
+            sb.AppendLine("Available columns in the tables being used:");
+            foreach (var tableName in usedTableNames.OrderBy(t => t))
+            {
+                var table = schema.Tables.FirstOrDefault(t =>
+                    t.Name.Equals(tableName, StringComparison.OrdinalIgnoreCase));
+
+                if (table != null)
+                {
+                    sb.AppendLine($"  [{table.Schema}].[{table.Name}]:");
+                    foreach (var col in table.Columns.OrderBy(c => c.Name))
+                    {
+                        var valuesMarker = (col.SampleValues != null && col.SampleValues.Count > 0)
+                            ? $" [Actual values: {string.Join(", ", col.SampleValues.Select(v => $"'{v}'"))}]"
+                            : "";
+                        sb.AppendLine($"    - [{col.Name}] ({col.Type}){valuesMarker}");
+                    }
+                }
+            }
+            sb.AppendLine();
+        }
+
+        sb.AppendLine("ORIGINAL SQL (returned zero rows):");
+        sb.AppendLine(originalSql);
+        sb.AppendLine();
+        sb.AppendLine("Carefully review the query and consider the most common causes of unexpectedly empty results:");
+        sb.AppendLine("- Date range filters (e.g. comparing against GETDATE()) that are too narrow, use the wrong column, or exclude all existing rows.");
+        sb.AppendLine("- INNER JOINs that silently drop rows when a related table has no matching record; consider whether a LEFT JOIN with appropriate NULL handling is more correct.");
+        sb.AppendLine("- WHERE clause conditions (status filters, exemption/exclusion logic, IsActive flags, etc.) that are more restrictive than intended or reference the wrong column/value.");
+        sb.AppendLine("- CTEs chained together where an early CTE filters out all rows, causing every downstream CTE to also be empty.");
+        sb.AppendLine("- Mismatched data types or case-sensitive string comparisons preventing otherwise valid matches.");
+        sb.AppendLine("- A string literal compared against a lookup/status/type column (e.g. WHERE [StatusName] = 'Absent') that does not exactly match any of the [Actual values: ...] shown above for that column; check the actual values list and use the exact matching value instead of a guessed one.");
+        sb.AppendLine();
+        sb.AppendLine("If, after this review, you determine the query logic is correct and zero rows is genuinely the correct answer given the schema, return the SQL EXACTLY unchanged.");
+        sb.AppendLine("Otherwise, rewrite the SQL so it correctly returns the data that satisfies the section's purpose, using ONLY column names confirmed to exist in the schema shown above.");
+        sb.AppendLine("IMPORTANT: Return ONLY the SQL query, nothing else.");
         sb.AppendLine();
 
         return sb.ToString();

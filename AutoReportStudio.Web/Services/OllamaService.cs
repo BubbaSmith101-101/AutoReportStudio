@@ -12,6 +12,101 @@ public class OllamaGenerationResult
     public long TokensGenerated { get; set; } = 0;
 }
 
+// Sanitizes raw LLM JSON output by escaping unescaped control characters (e.g. literal
+// newlines/tabs inside multi-line SQL) that appear within JSON string literals, which
+// would otherwise cause System.Text.Json to throw "invalid within a JSON string".
+static class JsonSanitizer
+{
+    public static string SanitizeControlCharsInStrings(string json)
+    {
+        if (string.IsNullOrEmpty(json)) return json;
+
+        // Narrow to the outermost JSON object/array if there is surrounding text (e.g. markdown fences)
+        var start = json.IndexOfAny(new[] { '{', '[' });
+        var end = json.LastIndexOfAny(new[] { '}', ']' });
+        var span = (start >= 0 && end > start) ? json.Substring(start, end - start + 1) : json;
+
+        var sb = new System.Text.StringBuilder(span.Length + 16);
+        var inString = false;
+
+        for (var i = 0; i < span.Length; i++)
+        {
+            var c = span[i];
+
+            if (inString)
+            {
+                if (c == '\\')
+                {
+                    // Look ahead to determine if this is a valid JSON escape sequence.
+                    // Valid: \" \\ \/ \b \f \n \r \t \uXXXX
+                    var next = (i + 1 < span.Length) ? span[i + 1] : '\0';
+                    switch (next)
+                    {
+                        case '"':
+                        case '\\':
+                        case '/':
+                        case 'b':
+                        case 'f':
+                        case 'n':
+                        case 'r':
+                        case 't':
+                            sb.Append(c).Append(next);
+                            i++;
+                            continue;
+                        case 'u':
+                            // Only treat as a valid unicode escape if followed by 4 hex digits
+                            if (i + 5 < span.Length && IsHex(span[i + 2]) && IsHex(span[i + 3]) && IsHex(span[i + 4]) && IsHex(span[i + 5]))
+                            {
+                                sb.Append(c).Append(next);
+                                i++;
+                                continue;
+                            }
+                            // Invalid \u escape - escape the backslash itself so it is treated literally
+                            sb.Append("\\\\");
+                            continue;
+                        default:
+                            // Invalid escape sequence (e.g. "\)"). Escape the backslash itself
+                            // so the LLM's stray backslash is preserved as a literal character
+                            // instead of producing an invalid JSON escape.
+                            sb.Append("\\\\");
+                            continue;
+                    }
+                }
+
+                if (c == '"')
+                {
+                    sb.Append(c);
+                    inString = false;
+                    continue;
+                }
+
+                switch (c)
+                {
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < 0x20)
+                            sb.Append("\\u").Append(((int)c).ToString("x4"));
+                        else
+                            sb.Append(c);
+                        break;
+                }
+            }
+            else
+            {
+                sb.Append(c);
+                if (c == '"') inString = true;
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    private static bool IsHex(char c) =>
+        (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
 static class SqlValidator
 {
     public static void ValidateAndRepairPlan(ReportPlan plan, DbSchema schema, ILogger logger)
@@ -81,6 +176,142 @@ static class SqlValidator
 
             if (madeChange) sec.Sql = repaired;
         }
+    }
+
+    private static readonly Regex AggregateFuncRegex = new(
+        @"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex TableAliasExtractRegex = new(
+        @"\b(?:FROM|JOIN)\s+\[([^\]]+)\]\.\[([^\]]+)\]\s+(?:AS\s+)?([A-Za-z0-9_]+)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex StringLiteralComparisonRegex = new(
+        @"\b([A-Za-z0-9_]+)\.\[([^\]]+)\]\s*(?:=|LIKE)\s*N?'([^']*)'",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Extracts the alias -> (schema, table) map from a query's FROM/JOIN clauses.
+    /// </summary>
+    public static Dictionary<string, (string Schema, string Table)> ExtractAliasMap(string sql)
+    {
+        var aliasMap = new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(sql)) return aliasMap;
+
+        foreach (Match m in TableAliasExtractRegex.Matches(sql))
+        {
+            aliasMap[m.Groups[3].Value] = (m.Groups[1].Value, m.Groups[2].Value);
+        }
+        return aliasMap;
+    }
+
+    /// <summary>
+    /// Extracts alias-qualified string literal equality/LIKE comparisons (e.g. ast.[StatusName] = 'Absent')
+    /// so callers can verify the literal actually exists in the referenced column's data.
+    /// </summary>
+    public static List<(string Alias, string Column, string Value)> ExtractStringLiteralComparisons(string sql)
+    {
+        var results = new List<(string, string, string)>();
+        if (string.IsNullOrWhiteSpace(sql)) return results;
+
+        foreach (Match m in StringLiteralComparisonRegex.Matches(sql))
+        {
+            results.Add((m.Groups[1].Value, m.Groups[2].Value, m.Groups[3].Value));
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// Detects nested aggregate function calls (e.g. AVG(COUNT(*)), SUM(AVG(x)), AVG(CAST(COUNT(*) AS float)))
+    /// which SQL Server rejects with "Cannot perform an aggregate function on an expression containing
+    /// an aggregate or a subquery." Returns a description of the first offending nested call found, or
+    /// null if no nested aggregates are detected.
+    /// </summary>
+    public static string? FindNestedAggregate(string sql)
+    {
+        if (string.IsNullOrWhiteSpace(sql)) return null;
+
+        foreach (Match outer in AggregateFuncRegex.Matches(sql))
+        {
+            var outerFunc = outer.Groups[1].Value;
+            var openParenIndex = outer.Index + outer.Length - 1; // index of the '(' just matched
+
+            // Find the matching closing parenthesis for this aggregate call
+            var depth = 0;
+            var closeIndex = -1;
+            for (var i = openParenIndex; i < sql.Length; i++)
+            {
+                if (sql[i] == '(') depth++;
+                else if (sql[i] == ')')
+                {
+                    depth--;
+                    if (depth == 0)
+                    {
+                        closeIndex = i;
+                        break;
+                    }
+                }
+            }
+
+            if (closeIndex < 0) continue; // unbalanced parens, let other validation catch it
+
+            var inner = sql.Substring(openParenIndex + 1, closeIndex - openParenIndex - 1);
+
+            // Look for another aggregate function call inside this one's argument list.
+            // (CAST/CONVERT wrapping is fine to skip through since we search the whole inner text.)
+            var innerMatch = AggregateFuncRegex.Match(inner);
+            if (innerMatch.Success)
+            {
+                // Ignore the case where the "nested" match is actually inside a subquery's own
+                // SELECT that is itself wrapped as a scalar subquery correlated differently - a
+                // simple heuristic: if inner contains "SELECT", treat it as a subquery (allowed
+                // pattern like AVG((SELECT COUNT(*) ...)) is unusual but not the common failure mode).
+                if (inner.Contains("SELECT", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var innerFunc = innerMatch.Groups[1].Value;
+                return $"{outerFunc}(...{innerFunc}(...)...) - nested aggregate functions are not allowed; use a CTE or subquery to compute the inner aggregate first";
+            }
+        }
+
+        return null;
+    }
+
+    private static readonly Regex GroupByClauseRegex = new(
+        @"\bGROUP\s+BY\s+(?<list>.+?)(?=\b(?:ORDER\s+BY|HAVING|;)|$)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.Singleline);
+
+    /// <summary>
+    /// Detects GROUP BY clauses whose grouping items are all string/numeric literals
+    /// (e.g. GROUP BY 'Active') rather than actual column references. SQL Server rejects
+    /// this with "Each GROUP BY expression must contain at least one column that is not
+    /// an outer reference." Returns a description of the offending clause, or null if the
+    /// GROUP BY clause contains at least one real column reference.
+    /// </summary>
+    public static string? FindGroupByLiteralOnly(string sql)
+    {
+        if (string.IsNullOrWhiteSpace(sql)) return null;
+
+        var m = GroupByClauseRegex.Match(sql);
+        if (!m.Success) return null;
+
+        var list = m.Groups["list"].Value.Trim().TrimEnd(')');
+
+        // Split on top-level commas (grouping items are rarely nested with parens here).
+        var items = list.Split(',').Select(i => i.Trim()).Where(i => i.Length > 0).ToList();
+        if (items.Count == 0) return null;
+
+        var allLiterals = items.All(i =>
+            (i.StartsWith("'") && i.EndsWith("'")) ||
+            (i.StartsWith("N'") && i.EndsWith("'")) ||
+            Regex.IsMatch(i, @"^-?\d+(\.\d+)?$"));
+
+        if (allLiterals)
+        {
+            return $"GROUP BY {list} - grouping by only a constant literal is not allowed; group by an actual column, or remove the GROUP BY and use the literal directly in the SELECT list";
+        }
+
+        return null;
     }
 
     public static string? GetInvalidColumnErrors(ReportPlan plan, DbSchema schema, ILogger logger)
@@ -187,7 +418,7 @@ public interface IOllamaService
 { 
     Task<List<string>> ListModels(CancellationToken ct = default);
     Task<List<OllamaModelInfo>> ListModelsWithDetails(CancellationToken ct = default);
-    Task<ReportPlan> Plan(DbSchema schema, string request, string? selectedModel = null, CancellationToken ct = default); 
+    Task<ReportPlan> Plan(DbSchema schema, string request, string? selectedModel = null, CancellationToken ct = default, string? connectionString = null); 
     Task<string> Summarize(ReportResult report, string? selectedModel = null, CancellationToken ct = default);
     long GetTotalTokensGenerated();
     void ResetTokenCount();
@@ -199,14 +430,16 @@ public class OllamaService : IOllamaService
     readonly IConfiguration cfg;
     readonly ILogger<OllamaService> logger;
     readonly ILLMCorrectionService correctionService;
+    readonly ISchemaService schemaService;
     private long totalTokensGenerated = 0;
 
-    public OllamaService(IHttpClientFactory f, IConfiguration cfg, ILogger<OllamaService> l, ILLMCorrectionService correctionService) 
+    public OllamaService(IHttpClientFactory f, IConfiguration cfg, ILogger<OllamaService> l, ILLMCorrectionService correctionService, ISchemaService schemaService) 
     { 
         this.f = f; 
         this.cfg = cfg;
         logger = l;
         this.correctionService = correctionService;
+        this.schemaService = schemaService;
     }
 
     public long GetTotalTokensGenerated()
@@ -362,7 +595,12 @@ public class OllamaService : IOllamaService
             {
                 foreach (var col in table.Columns.OrderBy(c => c.Name))
                 {
-                    sb.AppendLine($"  - [{col.Name}] ({col.Type})" + (col.PrimaryKey ? " [PK]" : ""));
+                    var line = $"  - [{col.Name}] ({col.Type})" + (col.PrimaryKey ? " [PK]" : "");
+                    if (col.SampleValues != null && col.SampleValues.Count > 0)
+                    {
+                        line += $" [Actual values: {string.Join(", ", col.SampleValues.Select(v => $"'{v}'"))}]";
+                    }
+                    sb.AppendLine(line);
                 }
             }
             sb.AppendLine();
@@ -370,7 +608,7 @@ public class OllamaService : IOllamaService
         return sb.ToString();
     }
 
-    public async Task<ReportPlan> Plan(DbSchema schema, string request, string? selectedModel = null, CancellationToken ct = default)
+    public async Task<ReportPlan> Plan(DbSchema schema, string request, string? selectedModel = null, CancellationToken ct = default, string? connectionString = null)
     {
         logger.LogDebug("Entering Plan method");
         try
@@ -475,6 +713,7 @@ Each section must contain:
 * purpose: Short explanation of what the section shows.
 * type: Either ""table"" or ""chart"".
 * sql: SQL Server SELECT query.
+* confidence: A number from 0 to 100 representing how confident you are that the SQL is syntactically correct, uses only real columns from the supplied schema, and accurately answers the section's purpose. Use 90-100 only when you are certain every table, column, join, and aggregate is correct. Lower the value when you are uncertain about column names, join conditions, or whether the query fully satisfies the user's request.
 
 For a chart section, also include:
 
@@ -547,7 +786,8 @@ EXAMPLE OUTPUT SHAPE
 ""xAxis"": null,
 ""yAxis"": null,
 ""xAxisTitle"": null,
-""yAxisTitle"": null
+""yAxisTitle"": null,
+""confidence"": 95
 }},
 {{
 ""heading"": ""Monthly Trend"",
@@ -558,7 +798,8 @@ EXAMPLE OUTPUT SHAPE
 ""xAxis"": ""Month"",
 ""yAxis"": ""Total"",
 ""xAxisTitle"": ""Month"",
-""yAxisTitle"": ""Total""
+""yAxisTitle"": ""Total"",
+""confidence"": 85
 }}
 ]
 }}
@@ -582,10 +823,11 @@ Before returning the plan, verify that:
 * Every SQL query in every section must be tested mentally: does the WHERE clause correctly filter data, are the JOINs using valid foreign keys, will the GROUP BY produce meaningful groups, and will the result set contain at least one row if the table is not empty?
 * NO nested aggregate functions are permitted. If the design requires averaging a count or summing a sum, use a CTE with a subquery first.
 * Ensure that all date-range filters (such as DATEADD(DAY, -90, CAST(GETDATE() AS DATE))) use the correct offset direction; the example (DAY, -90, ...) means 90 days in the past.
+* CRITICAL: When a column shows an ""[Actual values: ...]"" list in the column reference guide below, that column is a lookup/status/type column and you MUST use one of the exact listed values (matching case and spelling) in any WHERE/HAVING/CASE comparison against that column. Do NOT guess a plausible-sounding value (e.g. 'Absent' or 'Inactive') if it is not in the listed actual values - doing so will silently return zero rows even though matching data exists.
 
 COLUMN REFERENCE GUIDE
 
-The following table lists each table's name and its actual columns. Use ONLY these exact column names in your SQL:
+The following table lists each table's name and its actual columns. Use ONLY these exact column names in your SQL. Where shown, [Actual values: ...] lists the real distinct values stored in that column - use those exact values, not guesses:
 
 {BuildColumnReferenceGuide(schema)}
 
@@ -599,8 +841,12 @@ SUPPLIED SCHEMA (JSON):
             var txt = await Generate(prompt, selectedModel, ct);
             logger.LogDebug("AI plan response received, deserializing");
 
-            var plan = JsonSerializer.Deserialize<ReportPlan>(txt, new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? throw new Exception("Invalid Ollama report plan.");
+            var sanitizedTxt = JsonSanitizer.SanitizeControlCharsInStrings(txt);
+            var plan = JsonSerializer.Deserialize<ReportPlan>(sanitizedTxt, new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? throw new Exception("Invalid Ollama report plan.");
             logger.LogInformation("Report plan generated successfully with {SectionCount} sections", plan.Sections.Count);
+
+            foreach (var s in plan.Sections)
+                s.Confidence = Math.Clamp(s.Confidence, 0, 100);
 
             // Validate and attempt to repair SQL using the supplied schema to avoid invalid column/table names
             try
@@ -634,6 +880,8 @@ SUPPLIED SCHEMA (JSON):
                     if (corrected != null)
                     {
                         sec.Sql = corrected.Sql;
+                        // Self-correction was needed, so reduce confidence to reflect the uncertainty introduced
+                        sec.Confidence = Math.Clamp(Math.Min(sec.Confidence, 60) - (hallucinatedColumns.Count * 5), 0, 100);
                         logger.LogInformation("Section '{Heading}' SQL successfully self-corrected by LLM.", sec.Heading);
                     }
                     else
@@ -644,6 +892,146 @@ SUPPLIED SCHEMA (JSON):
                         // Invalidate the SQL so the read-only validator in ReportService rejects it
                         // instead of executing a query against non-existent columns.
                         sec.Sql = $"-- Unable to generate valid SQL: hallucinated columns could not be corrected ({string.Join(", ", hallucinatedColumns)})";
+                        sec.Confidence = 0;
+                    }
+                }
+
+                // Proactively detect nested aggregate functions (e.g. AVG(COUNT(*))) before execution,
+                // since SQL Server rejects these with "Cannot perform an aggregate function on an
+                // expression containing an aggregate or a subquery." Ask the LLM to self-correct rather
+                // than waiting for an execution failure.
+                foreach (var sec in plan.Sections)
+                {
+                    if (string.IsNullOrWhiteSpace(sec.Sql) || sec.Sql.StartsWith("--")) continue;
+
+                    var nestedAggregateDescription = SqlValidator.FindNestedAggregate(sec.Sql);
+                    if (nestedAggregateDescription == null) continue;
+
+                    logger.LogWarning(
+                        "Section '{Heading}' contains a nested aggregate function: {Description}. Requesting LLM self-correction.",
+                        sec.Heading, nestedAggregateDescription);
+
+                    var errorMessage =
+                        $"Cannot perform an aggregate function on an expression containing an aggregate or a subquery. Detected pattern: {nestedAggregateDescription}";
+
+                    var corrected = await correctionService.CorrectSqlExecutionError(
+                        sec, schema, errorMessage, request, selectedModel, ct);
+
+                    if (corrected != null && !string.IsNullOrWhiteSpace(corrected.Sql) &&
+                        SqlValidator.FindNestedAggregate(corrected.Sql) == null)
+                    {
+                        sec.Sql = corrected.Sql;
+                        sec.Confidence = Math.Clamp(Math.Min(sec.Confidence, 60), 0, 100);
+                        logger.LogInformation("Section '{Heading}' nested aggregate SQL successfully self-corrected by LLM.", sec.Heading);
+                    }
+                    else
+                    {
+                        logger.LogError(
+                            "Section '{Heading}' still contains a nested aggregate function after correction attempts. Marking query as invalid.",
+                            sec.Heading);
+                        sec.Sql = $"-- Unable to generate valid SQL: nested aggregate function could not be corrected ({nestedAggregateDescription})";
+                        sec.Confidence = 0;
+                    }
+                }
+
+                // Proactively detect GROUP BY clauses that group only by constant literals
+                // (e.g. GROUP BY 'Active'), which SQL Server rejects with "Each GROUP BY
+                // expression must contain at least one column that is not an outer reference."
+                foreach (var sec in plan.Sections)
+                {
+                    if (string.IsNullOrWhiteSpace(sec.Sql) || sec.Sql.StartsWith("--")) continue;
+
+                    var groupByLiteralDescription = SqlValidator.FindGroupByLiteralOnly(sec.Sql);
+                    if (groupByLiteralDescription == null) continue;
+
+                    logger.LogWarning(
+                        "Section '{Heading}' has a GROUP BY clause with only constant literals: {Description}. Requesting LLM self-correction.",
+                        sec.Heading, groupByLiteralDescription);
+
+                    var errorMessage =
+                        $"Each GROUP BY expression must contain at least one column that is not an outer reference. Detected pattern: {groupByLiteralDescription}";
+
+                    var corrected = await correctionService.CorrectSqlExecutionError(
+                        sec, schema, errorMessage, request, selectedModel, ct);
+
+                    if (corrected != null && !string.IsNullOrWhiteSpace(corrected.Sql) &&
+                        SqlValidator.FindGroupByLiteralOnly(corrected.Sql) == null)
+                    {
+                        sec.Sql = corrected.Sql;
+                        sec.Confidence = Math.Clamp(Math.Min(sec.Confidence, 60), 0, 100);
+                        logger.LogInformation("Section '{Heading}' literal-only GROUP BY successfully self-corrected by LLM.", sec.Heading);
+                    }
+                    else
+                    {
+                        logger.LogError(
+                            "Section '{Heading}' still has a literal-only GROUP BY clause after correction attempts. Marking query as invalid.",
+                            sec.Heading);
+                        sec.Sql = $"-- Unable to generate valid SQL: literal-only GROUP BY clause could not be corrected ({groupByLiteralDescription})";
+                        sec.Confidence = 0;
+                    }
+                }
+
+                // Verify that string literals compared against lookup/status/type columns
+                // (e.g. ast.[StatusName] = 'Absent') actually exist in the database, rather than
+                // being a plausible-sounding guess by the LLM. This directly targets queries
+                // that execute successfully but return zero rows because the literal doesn't
+                // match any real value. Only runs when a connection string was supplied.
+                if (!string.IsNullOrWhiteSpace(connectionString))
+                {
+                    foreach (var sec in plan.Sections)
+                    {
+                        if (string.IsNullOrWhiteSpace(sec.Sql) || sec.Sql.StartsWith("--")) continue;
+
+                        var aliasMap = SqlValidator.ExtractAliasMap(sec.Sql);
+                        var literalComparisons = SqlValidator.ExtractStringLiteralComparisons(sec.Sql);
+                        if (literalComparisons.Count == 0) continue;
+
+                        foreach (var (alias, column, value) in literalComparisons)
+                        {
+                            if (!aliasMap.TryGetValue(alias, out var tableRef)) continue;
+
+                            var table = schema.Tables.FirstOrDefault(t =>
+                                string.Equals(t.Schema, tableRef.Schema, StringComparison.OrdinalIgnoreCase) &&
+                                string.Equals(t.Name, tableRef.Table, StringComparison.OrdinalIgnoreCase));
+                            if (table == null) continue;
+
+                            var col = table.Columns.FirstOrDefault(c => string.Equals(c.Name, column, StringComparison.OrdinalIgnoreCase));
+                            if (col == null) continue;
+                            if (col.Type is not ("varchar" or "nvarchar" or "char" or "nchar" or "text" or "ntext")) continue;
+
+                            // Reuse already-sampled values if available; otherwise ask the database directly
+                            var actualValues = col.SampleValues != null && col.SampleValues.Count > 0
+                                ? col.SampleValues
+                                : await schemaService.GetDistinctValues(connectionString, table.Schema, table.Name, col.Name, 50, ct);
+
+                            if (actualValues.Count == 0) continue; // couldn't verify, leave as-is
+
+                            var matches = actualValues.Any(v => string.Equals(v, value, StringComparison.OrdinalIgnoreCase));
+                            if (matches) continue;
+
+                            logger.LogWarning(
+                                "Section '{Heading}' compares {Table}.{Column} to literal '{Value}' which does not match any actual value ({ActualValues}). Requesting LLM self-correction.",
+                                sec.Heading, table.FullName, col.Name, value, string.Join(", ", actualValues));
+
+                            var errorMessage =
+                                $"The value '{value}' does not exist in column [{table.Schema}].[{table.Name}].[{col.Name}]. " +
+                                $"The actual distinct values in that column are: {string.Join(", ", actualValues.Select(v => $"'{v}'"))}. " +
+                                $"Rewrite the query to use the correct matching value from this list.";
+
+                            var corrected = await correctionService.CorrectSqlExecutionError(
+                                sec, schema, errorMessage, request, selectedModel, ct);
+
+                            if (corrected != null && !string.IsNullOrWhiteSpace(corrected.Sql))
+                            {
+                                sec.Sql = corrected.Sql;
+                                sec.Confidence = Math.Clamp(Math.Min(sec.Confidence, 70), 0, 100);
+                                logger.LogInformation("Section '{Heading}' corrected to use an actual column value instead of guessed literal '{Value}'.", sec.Heading, value);
+                            }
+                            else
+                            {
+                                logger.LogWarning("Section '{Heading}' could not be corrected for mismatched literal '{Value}'. Leaving original SQL in place.", sec.Heading, value);
+                            }
+                        }
                     }
                 }
             }
@@ -737,7 +1125,8 @@ SUPPLIED SCHEMA (JSON):
 
             if (summary) 
             { 
-                using var doc = JsonDocument.Parse(text); 
+                var sanitizedSummaryJson = JsonSanitizer.SanitizeControlCharsInStrings(text);
+                using var doc = JsonDocument.Parse(sanitizedSummaryJson); 
                 return doc.RootElement.GetProperty("summary").GetString() ?? ""; 
             }
             return text;

@@ -61,7 +61,7 @@ public class ReportService : IReportService
             }
 
             logger.LogDebug("Requesting AI plan for report with selectedModel: {SelectedModel}", selectedModel);
-            var plan = await ollama.Plan(db, request, selectedModel, ct); 
+            var plan = await ollama.Plan(db, request, selectedModel, ct, cs); 
             logger.LogInformation("AI plan generated with {SectionCount} sections", plan.Sections.Count);
 
             var result = new ReportResult { Title = plan.Title, ModelUsed = selectedModel ?? "", UserRequest = request };
@@ -83,7 +83,8 @@ public class ReportService : IReportService
                     XAxis = p.XAxis,
                     YAxis = p.YAxis,
                     XAxisTitle = p.XAxisTitle,
-                    YAxisTitle = p.YAxisTitle
+                    YAxisTitle = p.YAxisTitle,
+                    Confidence = Math.Clamp(p.Confidence, 0, 100)
                 };
                 result.Sections.Add(sec);
 
@@ -102,7 +103,7 @@ public class ReportService : IReportService
                 }
                 catch (Exception ex) 
                 { 
-                    logger.LogError(ex, "Error executing query for section {SectionHeading}: {ErrorMessage}", p.Heading, ex.Message);
+                    logger.LogError(ex, "Error executing query for section {SectionHeading}: {ErrorMessage}. SQL: {Sql}", p.Heading, ex.Message, sec.Sql); 
                     sec.Purpose += " Query failed: " + ex.Message; 
                 }
                 processedSections++;
@@ -155,27 +156,76 @@ public class ReportService : IReportService
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "Query failed for section {SectionHeading}, attempting LLM self-correction: {ErrorMessage}", p.Heading, ex.Message);
+            logger.LogWarning(ex, "Query failed for section {SectionHeading}, attempting LLM self-correction: {ErrorMessage}. SQL: {Sql}", p.Heading, ex.Message, p.Sql);
 
             var corrected = await correctionService.CorrectSqlExecutionError(
                 p, db, ex.Message, request, selectedModel, ct);
 
             if (corrected == null || string.IsNullOrWhiteSpace(corrected.Sql))
             {
+                logger.LogError("LLM was unable to correct failing SQL for section {SectionHeading}. Original error: {ErrorMessage}. SQL: {Sql}", p.Heading, ex.Message, p.Sql);
                 throw;
             }
 
             var q = Regex.Replace(corrected.Sql, @"(--.*?$)|(/\*.*?\*/)", " ", RegexOptions.Multiline | RegexOptions.Singleline).Trim();
             if (!(q.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase) || q.StartsWith("WITH", StringComparison.OrdinalIgnoreCase)) || Bad.IsMatch(q))
             {
-                logger.LogWarning("Corrected query for section {SectionHeading} rejected by read-only validator", p.Heading);
+                logger.LogWarning("Corrected query for section {SectionHeading} rejected by read-only validator. SQL: {Sql}", p.Heading, corrected.Sql);
                 throw;
             }
 
             sec.Sql = corrected.Sql;
             p.Sql = corrected.Sql;
-            logger.LogInformation("Retrying execution for section {SectionHeading} with LLM-corrected SQL", p.Heading);
-            await RunQuery(sec, corrected.Sql, cn, ct);
+            // Execution failed and required LLM self-correction, so reduce confidence accordingly
+            sec.Confidence = Math.Clamp(Math.Min(sec.Confidence, 50), 0, 100);
+            logger.LogInformation("Retrying execution for section {SectionHeading} with LLM-corrected SQL: {Sql}", p.Heading, corrected.Sql);
+            try
+            {
+                await RunQuery(sec, corrected.Sql, cn, ct);
+            }
+            catch (Exception retryEx)
+            {
+                logger.LogError(retryEx, "Corrected SQL still failed to execute for section {SectionHeading}: {ErrorMessage}. SQL: {Sql}", p.Heading, retryEx.Message, corrected.Sql);
+                throw;
+            }
+            return;
+        }
+
+        // Query executed successfully but returned no data. Ask the LLM to review the query in
+        // case overly restrictive filters/joins are excluding data that should have matched.
+        if (sec.Rows.Count == 0)
+        {
+            logger.LogInformation("Query for section {SectionHeading} returned zero rows, attempting LLM self-correction", p.Heading);
+
+            var revised = await correctionService.CorrectZeroResultQuery(p, db, request, selectedModel, ct);
+
+            if (revised == null || string.IsNullOrWhiteSpace(revised.Sql))
+            {
+                // Either the LLM confirmed zero rows is correct, or correction failed. Keep original result.
+                return;
+            }
+
+            var q = Regex.Replace(revised.Sql, @"(--.*?$)|(/\*.*?\*/)", " ", RegexOptions.Multiline | RegexOptions.Singleline).Trim();
+            if (!(q.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase) || q.StartsWith("WITH", StringComparison.OrdinalIgnoreCase)) || Bad.IsMatch(q))
+            {
+                logger.LogWarning("Zero-result-corrected query for section {SectionHeading} rejected by read-only validator. SQL: {Sql}", p.Heading, revised.Sql);
+                return;
+            }
+
+            try
+            {
+                await RunQuery(sec, revised.Sql, cn, ct);
+                sec.Sql = revised.Sql;
+                p.Sql = revised.Sql;
+                sec.Confidence = Math.Clamp(Math.Min(sec.Confidence, 60), 0, 100);
+                logger.LogInformation("Zero-result correction succeeded for section {SectionHeading}, revised query returned {RowCount} row(s)", p.Heading, sec.Rows.Count);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Revised query from zero-result correction failed to execute for section {SectionHeading}, keeping original zero-row result. SQL: {Sql}", p.Heading, revised.Sql);
+                sec.Columns.Clear();
+                sec.Rows.Clear();
+            }
         }
     }
 

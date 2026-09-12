@@ -48,6 +48,19 @@ public interface ILLMCorrectionService
         string userRequest,
         string? selectedModel = null,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Attempts to correct a section plan whose SQL executed successfully but returned zero
+    /// rows, in case overly restrictive WHERE/JOIN conditions are excluding data that should
+    /// have matched. Returns the corrected plan if the LLM produces a different query, or
+    /// null if max retries are exceeded or the LLM confirms zero rows is correct.
+    /// </summary>
+    Task<SectionPlan?> CorrectZeroResultQuery(
+        SectionPlan originalPlan,
+        DbSchema schema,
+        string userRequest,
+        string? selectedModel = null,
+        CancellationToken ct = default);
 }
 
 /// <summary>
@@ -61,6 +74,10 @@ public class LLMCorrectionService : ILLMCorrectionService
 
     // Maximum number of correction attempts before giving up
     private const int MaxCorrectionAttempts = 3;
+
+    // Zero-row results are not necessarily wrong (there may genuinely be no data), so we
+    // cap correction attempts lower than the hallucination/error correction flows.
+    private const int MaxZeroResultCorrectionAttempts = 2;
 
     public LLMCorrectionService(ILogger<LLMCorrectionService> l, HttpClient client, IConfiguration config)
     {
@@ -275,6 +292,114 @@ public class LLMCorrectionService : ILLMCorrectionService
 
         return null;
     }
+
+    /// <summary>
+    /// Attempts to correct a section plan whose SQL executed successfully but returned zero rows
+    /// </summary>
+    public async Task<SectionPlan?> CorrectZeroResultQuery(
+        SectionPlan originalPlan,
+        DbSchema schema,
+        string userRequest,
+        string? selectedModel = null,
+        CancellationToken ct = default)
+    {
+        if (originalPlan == null || string.IsNullOrWhiteSpace(originalPlan.Sql))
+            return null;
+
+        logger.LogInformation(
+            "Starting LLM self-correction for section '{SectionHeading}' after query returned zero rows",
+            originalPlan.Heading);
+
+        var currentPlan = new SectionPlan
+        {
+            Heading = originalPlan.Heading,
+            Purpose = originalPlan.Purpose,
+            Sql = originalPlan.Sql,
+            Type = originalPlan.Type,
+            ChartType = originalPlan.ChartType,
+            XAxis = originalPlan.XAxis,
+            YAxis = originalPlan.YAxis,
+            XAxisTitle = originalPlan.XAxisTitle,
+            YAxisTitle = originalPlan.YAxisTitle,
+            Confidence = originalPlan.Confidence
+        };
+
+        var attemptNumber = 0;
+
+        while (attemptNumber < MaxZeroResultCorrectionAttempts)
+        {
+            attemptNumber++;
+            logger.LogInformation(
+                "Zero-result correction attempt {AttemptNumber}/{MaxAttempts} for section '{SectionHeading}'",
+                attemptNumber, MaxZeroResultCorrectionAttempts, currentPlan.Heading);
+
+            try
+            {
+                var correctionPrompt = SchemaFormatterService.CreateZeroResultCorrectionPrompt(
+                    currentPlan.Sql,
+                    currentPlan.Heading,
+                    currentPlan.Purpose,
+                    userRequest,
+                    schema);
+
+                var correctionResponse = await GenerateCorrectionFromLLM(correctionPrompt, selectedModel, ct);
+
+                if (string.IsNullOrWhiteSpace(correctionResponse))
+                {
+                    logger.LogWarning(
+                        "LLM returned empty zero-result correction response for section '{SectionHeading}'",
+                        currentPlan.Heading);
+                    continue;
+                }
+
+                var correctedSql = ExtractSqlFromResponse(correctionResponse);
+                if (string.IsNullOrWhiteSpace(correctedSql))
+                    continue;
+
+                // If the LLM decided the query is already correct (zero rows is the right answer),
+                // it may return the exact same SQL. Stop retrying in that case.
+                if (string.Equals(NormalizeSql(correctedSql), NormalizeSql(currentPlan.Sql), StringComparison.OrdinalIgnoreCase))
+                {
+                    logger.LogInformation(
+                        "LLM confirmed zero rows is the correct result for section '{SectionHeading}'. No further correction attempted.",
+                        currentPlan.Heading);
+                    return null;
+                }
+
+                // Ensure the rewritten query didn't introduce hallucinated columns
+                var hallucinatedColumns = ValidateSQL(correctedSql, schema);
+                if (hallucinatedColumns.Count > 0)
+                {
+                    logger.LogWarning(
+                        "Zero-result correction for section '{SectionHeading}' introduced {Count} hallucinated column(s). Retrying...",
+                        currentPlan.Heading, hallucinatedColumns.Count);
+                    continue;
+                }
+
+                currentPlan.Sql = correctedSql;
+                logger.LogInformation(
+                    "Zero-result correction produced a revised query for section '{SectionHeading}' on attempt {AttemptNumber}",
+                    currentPlan.Heading, attemptNumber);
+                return currentPlan;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex,
+                    "Error during zero-result correction attempt {AttemptNumber} for section '{SectionHeading}': {ErrorMessage}",
+                    attemptNumber, currentPlan.Heading, ex.Message);
+                continue;
+            }
+        }
+
+        logger.LogWarning(
+            "Unable to obtain a revised query for section '{SectionHeading}' after {MaxAttempts} zero-result correction attempts. Keeping original zero-row result.",
+            originalPlan.Heading, MaxZeroResultCorrectionAttempts);
+
+        return null;
+    }
+
+    private static string NormalizeSql(string sql) =>
+        Regex.Replace(sql ?? "", @"\s+", " ").Trim().TrimEnd(';');
 
     /// <summary>
     /// Calls the LLM to generate corrected SQL

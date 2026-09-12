@@ -109,6 +109,27 @@ main {
     transform: rotate(90deg)
 }
 
+.confidence-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 12px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    vertical-align: middle;
+    white-space: nowrap;
+}
+
+.confidence-badge .confidence-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.85;
+}
+
 textarea {
     width: 100%;
     padding: 12px;
@@ -229,6 +250,43 @@ th, td {
 th {
     background: #f8fafc
 }
+
+th.sortable-col {
+    cursor: pointer;
+    user-select: none;
+}
+
+    th.sortable-col:hover {
+        background: #eef2f7
+    }
+
+    th.sortable-col .sort-indicator {
+        display: inline-block;
+        min-width: 12px;
+        color: #2563eb;
+        font-size: 11px;
+    }
+
+.filter-row th {
+    background: white;
+    padding: 4px 9px;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.column-filter {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 5px 8px;
+    border: 1px solid #dfe5ed;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 400;
+}
+
+    .column-filter:focus {
+        outline: none;
+        border-color: #2563eb;
+    }
 
 pre {
     white-space: pre-wrap;

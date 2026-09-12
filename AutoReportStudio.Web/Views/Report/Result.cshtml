@@ -10,6 +10,54 @@
         }
         return value;
     }
+
+    // Heat-map color for a confidence percentage: red (low) -> yellow (mid) -> green (high)
+    static string ConfidenceColor(double confidence)
+    {
+        var pct = Math.Clamp(confidence, 0, 100);
+        var hue = pct * 1.2; // 0 = red, 60 = yellow, 120 = green
+        return $"hsl({hue.ToString("F0")}, 75%, 42%)";
+    }
+
+    // Picks a readable text color (dark or light) based on the heat-map background's actual luminance
+    static string ConfidenceTextColor(double confidence)
+    {
+        var pct = Math.Clamp(confidence, 0, 100);
+        var hue = pct * 1.2;
+        var (r, g, b) = HslToRgb(hue, 0.75, 0.42);
+        // Relative luminance (per WCAG) to decide between dark and light text
+        var luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+        return luminance > 0.55 ? "#1f2937" : "#ffffff";
+    }
+
+    static (double r, double g, double b) HslToRgb(double h, double s, double l)
+    {
+        h = h / 360.0;
+        double r, g, b;
+        if (s == 0)
+        {
+            r = g = b = l;
+        }
+        else
+        {
+            double q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+            double p = 2 * l - q;
+            r = HueToRgb(p, q, h + 1.0 / 3.0);
+            g = HueToRgb(p, q, h);
+            b = HueToRgb(p, q, h - 1.0 / 3.0);
+        }
+        return (r * 255, g * 255, b * 255);
+    }
+
+    static double HueToRgb(double p, double q, double t)
+    {
+        if (t < 0) t += 1;
+        if (t > 1) t -= 1;
+        if (t < 1.0 / 6.0) return p + (q - p) * 6 * t;
+        if (t < 1.0 / 2.0) return q;
+        if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6;
+        return p;
+    }
 }
 <div class="head" id="report-top"><div><a asp-action="Index">← New report</a><h1>@Model.Title</h1></div><form asp-action="Export" method="post"><button>Export Excel</button></form></div>
 
@@ -53,7 +101,13 @@
 @foreach (var s in Model.Sections)
 {
     <details class="card section-card" data-section-index="@chartIndex" data-page-size="@s.PageSize" data-total-items="@s.Rows.Count" open>
-        <summary class="section-summary"><h2>@s.Heading</h2></summary>
+        <summary class="section-summary">
+            <h2>@s.Heading</h2>
+            <span class="confidence-badge" style="background-color:@ConfidenceColor(s.Confidence);color:@ConfidenceTextColor(s.Confidence)" title="LLM confidence that this section's SQL is correct and answers the request">
+                <span class="confidence-dot"></span>
+                @s.Confidence.ToString("F0")% confidence
+            </span>
+        </summary>
         <p>@s.Purpose</p>
         @if (string.Equals(s.Type, "chart", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(s.XAxis) && !string.IsNullOrEmpty(s.YAxis) && s.Columns.Count > 0)
         {
@@ -160,8 +214,14 @@
                 <button type="button" class="next-page-btn btn btn-secondary btn-sm" data-section-index="@chartIndex" @(s.CurrentPage >= s.TotalPages ? "disabled" : "")>&gt;</button>
                 <button type="button" class="last-page-btn btn btn-secondary btn-sm" data-section-index="@chartIndex" @(s.CurrentPage >= s.TotalPages ? "disabled" : "")>&raquo;</button>
             </div>
-            <div class="scroll"><table><thead><tr>@foreach(var c in s.Columns){
-                <th>@c</th>
+            <div class="scroll"><table><thead><tr>@for (int colIdx = 0; colIdx < s.Columns.Count; colIdx++){
+                <th class="sortable-col" data-col-index="@colIdx" title="Click to sort">
+                    <span class="col-name">@s.Columns[colIdx]</span>
+                    <span class="sort-indicator" aria-hidden="true"></span>
+                </th>
+        }
+        </tr><tr class="filter-row">@for (int colIdx = 0; colIdx < s.Columns.Count; colIdx++){
+                <th><input type="text" class="column-filter" data-col-index="@colIdx" placeholder="Filter..." /></th>
         }
         </tr></thead><tbody>
             @foreach(var row in s.Rows){
@@ -190,9 +250,12 @@
 
         // Report pagination functionality
         (function () {
-            function getPageSize(section) {
+            function getPageSize(section, totalRowsOverride) {
                 const select = section.querySelector('.page-size-select');
                 if (select && select.value === 'all') {
+                    if (typeof totalRowsOverride === 'number') {
+                        return totalRowsOverride || 1;
+                    }
                     return parseInt(section.dataset.totalRows) || parseInt(section.dataset.pageSize) || 50;
                 }
                 if (select) {
@@ -201,25 +264,36 @@
                 return parseInt(section.dataset.pageSize) || 50;
             }
 
+            function getVisibleRows(section) {
+                const rowsContainer = section.querySelector('.scroll table tbody');
+                if (!rowsContainer) return [];
+                return Array.from(rowsContainer.querySelectorAll('tr')).filter(row => row.dataset.filteredOut !== 'true');
+            }
+
             function showPage(section, page) {
                 const rowsContainer = section.querySelector('.scroll table tbody');
                 if (!rowsContainer) return;
 
-                // Get all rows (including hidden ones)
-                const allRows = rowsContainer.querySelectorAll('tr');
-                const totalRows = allRows.length;
-                const pageSize = getPageSize(section) || totalRows || 1;
+                // Only paginate over rows that pass the current column filters
+                const allRows = Array.from(rowsContainer.querySelectorAll('tr'));
+                const visibleRows = allRows.filter(row => row.dataset.filteredOut !== 'true');
+                const totalRows = visibleRows.length;
+                const pageSize = getPageSize(section, totalRows) || totalRows || 1;
                 const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
 
-                if (totalRows === 0) return;
                 if (page < 1) page = 1;
                 if (page > totalPages) page = totalPages;
 
                 const startIndex = (page - 1) * pageSize;
                 const endIndex = Math.min(startIndex + pageSize, totalRows);
 
-                // Hide all rows first
-                allRows.forEach((row, index) => {
+                // Hide filtered-out rows entirely, and page through the remaining visible rows
+                allRows.forEach((row) => {
+                    if (row.dataset.filteredOut === 'true') {
+                        row.style.display = 'none';
+                    }
+                });
+                visibleRows.forEach((row, index) => {
                     row.style.display = index >= startIndex && index < endIndex ? '' : 'none';
                 });
 
@@ -259,6 +333,75 @@
                 }
             }
 
+            function applyFilters(section) {
+                const rowsContainer = section.querySelector('.scroll table tbody');
+                if (!rowsContainer) return;
+
+                const filterInputs = Array.from(section.querySelectorAll('.column-filter'));
+                const filters = filterInputs
+                    .map(input => ({ colIndex: parseInt(input.dataset.colIndex), value: input.value.trim().toLowerCase() }))
+                    .filter(f => f.value.length > 0);
+
+                const allRows = Array.from(rowsContainer.querySelectorAll('tr'));
+                allRows.forEach(row => {
+                    const cells = row.querySelectorAll('td');
+                    const matches = filters.every(f => {
+                        const cell = cells[f.colIndex];
+                        const text = cell ? cell.textContent.toLowerCase() : '';
+                        return text.includes(f.value);
+                    });
+                    if (matches) {
+                        delete row.dataset.filteredOut;
+                    } else {
+                        row.dataset.filteredOut = 'true';
+                    }
+                });
+
+                showPage(section, 1);
+            }
+
+            function sortByColumn(section, colIndex, direction) {
+                const rowsContainer = section.querySelector('.scroll table tbody');
+                if (!rowsContainer) return;
+
+                const allRows = Array.from(rowsContainer.querySelectorAll('tr'));
+                const getCellValue = (row) => {
+                    const cell = row.querySelectorAll('td')[colIndex];
+                    return cell ? cell.textContent.trim() : '';
+                };
+
+                allRows.sort((rowA, rowB) => {
+                    const a = getCellValue(rowA);
+                    const b = getCellValue(rowB);
+                    const numA = parseFloat(a.replace(/,/g, ''));
+                    const numB = parseFloat(b.replace(/,/g, ''));
+                    let cmp;
+                    if (a !== '' && b !== '' && !isNaN(numA) && !isNaN(numB)) {
+                        cmp = numA - numB;
+                    } else {
+                        cmp = a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true });
+                    }
+                    return direction === 'desc' ? -cmp : cmp;
+                });
+
+                allRows.forEach(row => rowsContainer.appendChild(row));
+
+                // Update sort indicators
+                section.querySelectorAll('.sortable-col').forEach(th => {
+                    const indicator = th.querySelector('.sort-indicator');
+                    if (!indicator) return;
+                    if (parseInt(th.dataset.colIndex) === colIndex) {
+                        indicator.textContent = direction === 'asc' ? ' \u25B2' : ' \u25BC';
+                        th.dataset.sortDirection = direction;
+                    } else {
+                        indicator.textContent = '';
+                        delete th.dataset.sortDirection;
+                    }
+                });
+
+                showPage(section, 1);
+            }
+
             // Set up event listeners for pagination buttons
             document.addEventListener('click', function (e) {
                 if (e.target.matches('.first-page-btn, .prev-page-btn, .next-page-btn, .last-page-btn')) {
@@ -288,6 +431,37 @@
                     const section = e.target.closest('details');
                     if (!section) return;
                     showPage(section, 1);
+                }
+            });
+
+            // Set up event listener for column header clicks to sort ascending/descending
+            document.addEventListener('click', function (e) {
+                const th = e.target.closest('.sortable-col');
+                if (!th) return;
+                const section = th.closest('details');
+                if (!section) return;
+
+                const colIndex = parseInt(th.dataset.colIndex);
+                const currentDirection = th.dataset.sortDirection;
+                const nextDirection = currentDirection === 'asc' ? 'desc' : 'asc';
+                sortByColumn(section, colIndex, nextDirection);
+            });
+
+            // Set up event listener for per-column filter inputs (debounced)
+            let filterDebounceTimer = null;
+            document.addEventListener('input', function (e) {
+                if (!e.target.matches('.column-filter')) return;
+                const section = e.target.closest('details');
+                if (!section) return;
+
+                clearTimeout(filterDebounceTimer);
+                filterDebounceTimer = setTimeout(() => applyFilters(section), 200);
+            });
+
+            // Prevent the filter row's inputs from toggling the details/summary section
+            document.addEventListener('click', function (e) {
+                if (e.target.matches('.column-filter')) {
+                    e.stopPropagation();
                 }
             });
 

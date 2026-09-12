@@ -422,6 +422,8 @@ public interface IOllamaService
     Task<string> Summarize(ReportResult report, string? selectedModel = null, CancellationToken ct = default);
     long GetTotalTokensGenerated();
     void ResetTokenCount();
+    int GetLastModelMaxContextLength();
+    int GetLastConfiguredContextLength();
 }
 
 public class OllamaService : IOllamaService
@@ -432,6 +434,8 @@ public class OllamaService : IOllamaService
     readonly ILLMCorrectionService correctionService;
     readonly ISchemaService schemaService;
     private long totalTokensGenerated = 0;
+    private int lastModelMaxContextLength = 0;
+    private int lastConfiguredContextLength = 0;
 
     public OllamaService(IHttpClientFactory f, IConfiguration cfg, ILogger<OllamaService> l, ILLMCorrectionService correctionService, ISchemaService schemaService) 
     { 
@@ -451,6 +455,77 @@ public class OllamaService : IOllamaService
     {
         totalTokensGenerated = 0;
         logger.LogDebug("Token count reset to 0");
+    }
+
+    public int GetLastModelMaxContextLength() => lastModelMaxContextLength;
+
+    public int GetLastConfiguredContextLength() => lastConfiguredContextLength;
+
+    // Caches each model's maximum context length (num_ctx) so we don't call /api/show on every request.
+    private static readonly Dictionary<string, int> ModelMaxContextCache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly SemaphoreSlim ModelMaxContextLock = new(1, 1);
+
+    /// <summary>
+    /// Queries Ollama's /api/show endpoint for the model's maximum context length so we can
+    /// force num_ctx to that value instead of relying on Ollama's default (often 2048-4096),
+    /// which can silently truncate a large schema + prompt and contribute to hallucinated columns.
+    /// </summary>
+    private async Task<int> GetModelMaxContextLength(string model, string url, CancellationToken ct)
+    {
+        if (ModelMaxContextCache.TryGetValue(model, out var cached))
+            return cached;
+
+        await ModelMaxContextLock.WaitAsync(ct);
+        try
+        {
+            if (ModelMaxContextCache.TryGetValue(model, out cached))
+                return cached;
+
+            const int fallback = 8192;
+            var client = f.CreateClient();
+            var res = await client.PostAsJsonAsync(url + "/api/show", new { model }, ct);
+            if (!res.IsSuccessStatusCode)
+            {
+                logger.LogWarning("Unable to fetch model info for '{Model}' from /api/show (status {StatusCode}); defaulting num_ctx to {Fallback}.", model, res.StatusCode, fallback);
+                ModelMaxContextCache[model] = fallback;
+                return fallback;
+            }
+
+            var body = await res.Content.ReadAsStringAsync(ct);
+            using var doc = JsonDocument.Parse(body);
+
+            var maxCtx = fallback;
+            if (doc.RootElement.TryGetProperty("model_info", out var modelInfo))
+            {
+                // The context length key is architecture-prefixed, e.g. "llama.context_length",
+                // "qwen2.context_length", "gemma2.context_length", etc. Find whichever key ends
+                // with ".context_length" rather than hardcoding an architecture name.
+                foreach (var prop in modelInfo.EnumerateObject())
+                {
+                    if (prop.Name.EndsWith(".context_length", StringComparison.OrdinalIgnoreCase) &&
+                        prop.Value.TryGetInt32(out var contextLength) && contextLength > 0)
+                    {
+                        maxCtx = contextLength;
+                        break;
+                    }
+                }
+            }
+
+            logger.LogInformation("Resolved max context length for model '{Model}': {MaxContext} tokens.", model, maxCtx);
+            ModelMaxContextCache[model] = maxCtx;
+            return maxCtx;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to resolve max context length for model '{Model}'; defaulting num_ctx to 8192.", model);
+            const int fallback = 8192;
+            ModelMaxContextCache[model] = fallback;
+            return fallback;
+        }
+        finally
+        {
+            ModelMaxContextLock.Release();
+        }
     }
 
     public async Task<List<string>> ListModels(CancellationToken ct = default)
@@ -1088,11 +1163,24 @@ SUPPLIED SCHEMA (JSON):
             var model = selectedModel ?? cfg["Ollama:Model"] ?? "qwen3-coder:30b";
             logger.LogDebug("Calling Ollama API at {Url} with model {Model}", url, model);
 
+            var maxContext = await GetModelMaxContextLength(model, url, ct);
+            // Use three-quarters of the model's maximum context length rather than the full
+            // amount, to leave headroom for the model's own internal overhead while still
+            // allowing a large schema/prompt.
+            var configuredContext = Math.Max(1, (int)(maxContext * 0.75));
+            lastModelMaxContextLength = maxContext;
+            lastConfiguredContextLength = configuredContext;
+
             var res = await client.PostAsJsonAsync(url + "/api/generate", new
             {
                 model,
                 prompt,
-                stream = false
+                stream = false,
+                options = new
+                {
+                    num_ctx = configuredContext,
+                    temperature = 0
+                }
             }, ct);
             logger.LogDebug("Ollama API response status: {StatusCode}", res.StatusCode);
 

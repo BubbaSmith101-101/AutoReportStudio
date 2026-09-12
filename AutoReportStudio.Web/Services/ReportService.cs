@@ -116,6 +116,8 @@ public class ReportService : IReportService
             var elapsed = DateTime.UtcNow - startTime;
             result.ProcessingTimeMs = (long)elapsed.TotalMilliseconds;
             result.TokensGenerated = ollama.GetTotalTokensGenerated();
+            result.ModelMaxContextLength = ollama.GetLastModelMaxContextLength();
+            result.ConfiguredContextLength = ollama.GetLastConfiguredContextLength();
 
             firstTokenCts.Cancel();
             try { await firstTokenWatch; } catch (OperationCanceledException) { }

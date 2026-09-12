@@ -8,6 +8,11 @@
         {
             return dt.TimeOfDay == TimeSpan.Zero ? dt.ToString("d") : dt.ToString("g");
         }
+        if (double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var num))
+        {
+            // Limit displayed decimal places to 2, without adding trailing zeros for whole numbers.
+            return num.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
+        }
         return value;
     }
 
@@ -88,6 +93,10 @@
         <div class="metric">
             <span class="metric-label">Model Used</span>
             <span class="metric-value">@(string.IsNullOrEmpty(Model.ModelUsed) ? "Default" : Model.ModelUsed)</span>
+        </div>
+        <div class="metric">
+            <span class="metric-label">Configured Context Length</span>
+            <span class="metric-value">@(Model.ConfiguredContextLength > 0 ? Model.ConfiguredContextLength.ToString("N0") + " tokens" : "Unknown")</span>
         </div>
         <div class="metric metric-wide">
             <span class="metric-label">Instructions</span>

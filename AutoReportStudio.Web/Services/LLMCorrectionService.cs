@@ -83,6 +83,10 @@ public class LLMCorrectionService : ILLMCorrectionService
     {
         logger = l;
         httpClient = client;
+        // The default HttpClient timeout (100s) is too short for larger local LLMs generating
+        // correction SQL; align with the timeout used for the primary Ollama plan generation.
+        if (httpClient.Timeout < TimeSpan.FromSeconds(300))
+            httpClient.Timeout = TimeSpan.FromSeconds(300);
         configuration = config;
     }
 
